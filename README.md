@@ -309,6 +309,9 @@ compatibility aliases such as `afd_role`, `afd_connector`, `afd_host`, and
 
 ## Development
 
+For contributor intent and pre-submit self-review, start with
+[Contributing](CONTRIBUTING.md).
+
 Run the default CPU-safe checks:
 
 ```bash
