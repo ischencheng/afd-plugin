@@ -8,9 +8,9 @@ import os
 import time
 from collections.abc import Callable
 from dataclasses import dataclass
+from datetime import timedelta
 
 import torch
-import torch.distributed as dist
 from torch.distributed.distributed_c10d import PrefixStore, Store
 from vllm.logger import init_logger
 
@@ -108,27 +108,15 @@ class AsyncCamStartupCoordinator:
         if self._store is not None:
             self._rendezvous_context.borrow()
             return self._store
-        store, process_group = self._rendezvous_context.borrow()
+        store, _ = self._rendezvous_context.borrow()
         topology = self._spec.topology
-        nonce = torch.zeros(
-            STARTUP_NONCE_BYTES,
-            dtype=torch.uint8,
-            device=f"npu:{self._spec.local_rank}",
-        )
+        # One startup per fresh CAM rendezvous Store. Exchange host metadata
+        # without an HCCL collective, allowing different A/F buffer sizes.
+        bootstrap = PrefixStore(f"{AFD_ASYNC_CAM_GROUP_NAME}/startup", store)
         if topology.world_rank == 0:
-            nonce.copy_(
-                torch.tensor(
-                    list(os.urandom(STARTUP_NONCE_BYTES)),
-                    dtype=torch.uint8,
-                    device=nonce.device,
-                )
-            )
-        logger.info("CAM startup nonce broadcast start rank=%d", topology.world_rank)
-        dist.broadcast(nonce, src=0, group=process_group)
-        logger.info("CAM startup nonce broadcast done rank=%d", topology.world_rank)
-        torch.npu.synchronize()
-        logger.info("CAM startup nonce synchronize done rank=%d", topology.world_rank)
-        namespace = bytes(nonce.cpu().tolist()).hex()
+            bootstrap.set("namespace", os.urandom(STARTUP_NONCE_BYTES).hex())
+        bootstrap.wait(["namespace"], timedelta(seconds=STARTUP_TIMEOUT_SECONDS))
+        namespace = bootstrap.get("namespace").decode()
         self._store = PrefixStore(
             f"{AFD_ASYNC_CAM_GROUP_NAME}/startup/{namespace}", store
         )

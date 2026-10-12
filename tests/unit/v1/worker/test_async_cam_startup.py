@@ -4,6 +4,8 @@
 
 from __future__ import annotations
 
+from concurrent.futures import ThreadPoolExecutor
+from threading import Barrier
 from types import SimpleNamespace
 
 import pytest
@@ -235,3 +237,85 @@ def test_repeated_eager_start_is_idempotent_and_closed_context_is_rejected():
     coordinator._rendezvous_context.invalidate()
     with pytest.raises(RuntimeError, match="not bound"):
         coordinator.start_ffn(**callbacks)
+
+
+@pytest.mark.parametrize("leader_first", [True, False])
+def test_nonce_uses_host_store_for_fresh_worlds(monkeypatch, leader_first):
+    """A1G/F4G needs no NPU collective for host-only startup metadata."""
+    monkeypatch.setattr(async_cam_startup, "STARTUP_TIMEOUT_SECONDS", 5)
+
+    def forbidden(*args, **kwargs):
+        pytest.fail("startup nonce touched the NPU collective path")
+
+    monkeypatch.setattr(async_cam_startup.torch.distributed, "broadcast", forbidden)
+    monkeypatch.setattr(async_cam_startup.torch, "zeros", forbidden)
+    monkeypatch.setattr(async_cam_startup.torch.npu, "synchronize", forbidden)
+
+    def connect(store, rank):
+        context = ProcessGroupRendezvousContext()
+        context.retain_store(store)
+        context.bind(SimpleNamespace())
+        topology = AFDAsyncTopology(
+            role="attention" if rank < 12 else "ffn",
+            role_rank=rank if rank < 12 else rank - 12,
+            world_rank=rank,
+            attn_size=12,
+            ffn_size=4,
+            expert_per_rank=64,
+        )
+        coordinator = AsyncCamStartupCoordinator(
+            SimpleNamespace(is_initialized=True),
+            context,
+            AsyncCamStartupSpec(
+                topology, 0, 4, 4096, 6, async_cam_startup.torch.bfloat16
+            ),
+        )
+        result = coordinator._get_store()
+        assert coordinator._get_store() is result
+        return result
+
+    prefix_store = async_cam_startup.PrefixStore
+    waiting = Barrier(16, timeout=5)
+
+    def make_prefix(prefix, store):
+        result = prefix_store(prefix, store)
+        if not leader_first and prefix.endswith("/startup"):
+
+            def wait(keys, timeout):
+                if not result.check(keys):
+                    waiting.wait()
+                result.wait(keys, timeout)
+
+            return SimpleNamespace(set=result.set, get=result.get, wait=wait)
+        return result
+
+    monkeypatch.setattr(async_cam_startup, "PrefixStore", make_prefix)
+
+    def connect_world():
+        store = async_cam_startup.torch.distributed.HashStore()
+        with ThreadPoolExecutor(max_workers=16) as pool:
+            leader = connect(store, 0) if leader_first else None
+            futures = [pool.submit(connect, store, rank) for rank in range(1, 16)]
+            if not leader_first:
+                # All peers have entered wait before the leader publishes.
+                waiting.wait()
+                leader = connect(store, 0)
+            return [leader] + [future.result(timeout=5) for future in futures]
+
+    first = connect_world()
+    first[0].set("ffn/12", "failed:previous receiver")
+    assert all(s.get("ffn/12") == b"failed:previous receiver" for s in first)
+    second = connect_world()
+    assert all(not s.check(["ffn/12"]) for s in second)
+    second[-1].set("ffn/12", "ready")
+    assert all(s.get("ffn/12") == b"ready" for s in second)
+    assert first[0].get("ffn/12") == b"failed:previous receiver"
+
+
+def test_nonce_times_out_without_leader(monkeypatch):
+    store = async_cam_startup.torch.distributed.HashStore()
+    coordinator, _ = make_coordinator(role="ffn", store=store)
+    coordinator._store = None
+    monkeypatch.setattr(async_cam_startup, "STARTUP_TIMEOUT_SECONDS", 0.05)
+    with pytest.raises(RuntimeError, match="[Tt]imeout"):
+        coordinator._get_store()
