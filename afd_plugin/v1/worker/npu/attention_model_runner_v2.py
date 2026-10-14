@@ -46,6 +46,7 @@ from afd_plugin.connectors import (
     AFDConnectorFactory,
     AFDForwardContextMetadata,
 )
+from afd_plugin.connectors.npu.async_cam import CAMAsyncAFDConnector
 from afd_plugin.model_executor.models.forward_context import use_afd_metadata_provider
 from afd_plugin.v1.worker.attention_metadata import (
     AFDMetadataProviderMixin,
@@ -531,6 +532,12 @@ class AFDNPUAttentionModelRunnerV2(AFDMetadataProviderMixin, NPUModelRunnerV2):
     # Removal/upstream plan: delete this wrapper if AFD-owned lifecycle moves
     # to a shared composition/factory owner; it never copies native cleanup.
     def shutdown(self) -> None:
+        # ### PATCH START: drain Async owners before native resource release.
+        # Quiesce failure deliberately preserves model/transport storage. The
+        # synchronous path below retains its original finalizer behavior.
+        if isinstance(self.connector, CAMAsyncAFDConnector):
+            self.connector.quiesce_attention()
+        # ### PATCH END: drain Async owners before native resource release.
         # ### PATCH START: guarantee profiler/native/connector cleanup.
         try:
             stop_afd_npu_profiler(self.prof)

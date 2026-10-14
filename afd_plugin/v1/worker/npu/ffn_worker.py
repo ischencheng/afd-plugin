@@ -6,6 +6,7 @@ from __future__ import annotations
 
 import logging
 import threading
+import time
 from typing import TYPE_CHECKING, Any
 
 import torch
@@ -22,8 +23,16 @@ from afd_plugin.compat.npu import (
     fix_all2all_backend_for_afd,
     npu_afd_num_ubatches,
 )
+from afd_plugin.connectors.npu.async_cam import (
+    POLL_SECONDS,
+    SHUTDOWN_TIMEOUT_SECONDS,
+    CAMAsyncAFDConnector,
+)
 from afd_plugin.model_executor.models.model_utils import get_afd_model_config
-from afd_plugin.v1.worker.npu.ffn_model_runner import AFDNPUFFNModelRunner
+from afd_plugin.v1.worker.npu.async_ffn_model_runner import (
+    AsyncNPUFFNModelRunner,
+    create_npu_ffn_model_runner,
+)
 from afd_plugin.validation import (
     NPU_FFN_WORKER_FQCN,
     assert_compatible_afd_stack,
@@ -78,7 +87,7 @@ class AFDNPUFFNWorker(NPUWorker):
             self.vllm_config.model_config,
             device_type="npu",
         )
-        self.model_runner = AFDNPUFFNModelRunner(self.vllm_config, self.device)
+        self.model_runner = create_npu_ffn_model_runner(self.vllm_config, self.device)
 
     def get_kv_cache_spec(self) -> dict[str, KVCacheSpec]:
         return {}
@@ -163,6 +172,12 @@ class AFDNPUFFNWorker(NPUWorker):
 
         torch.npu.set_device(self.device)
         while not event.is_set():
+            if isinstance(self.model_runner, AsyncNPUFFNModelRunner):
+                if not self.model_runner.execute_connector_driven_step():
+                    return
+                if self.model_runner.effective_mode == "eager":
+                    torch.npu.synchronize()
+                continue
             if self.model_runner.connector.control_plane is None:
                 self.model_runner.execute_connector_driven_step()
                 torch.npu.synchronize()
@@ -189,9 +204,40 @@ class AFDNPUFFNWorker(NPUWorker):
         if error is not None:
             self._ffn_loop_error = None
             raise RuntimeError("AFD NPU FFN worker loop failed") from error
+        if (
+            isinstance(self.model_runner, AsyncNPUFFNModelRunner)
+            and self.model_runner.effective_mode == "full"
+            and isinstance(self.model_runner.connector, CAMAsyncAFDConnector)
+            and self.model_runner.connector.graph_receiving
+        ):
+            self.model_runner.connector.poll_graph_stop()
 
     def stop_ffn_server_loop(self) -> None:
         event = self._ffn_shutdown_event
+        if (
+            isinstance(self.model_runner, AsyncNPUFFNModelRunner)
+            and self.model_runner.effective_mode == "full"
+        ):
+            # EngineCore's regular health polling stops when shutdown begins.
+            # This control RPC takes over drain/STOP until the service exits.
+            thread = self._ffn_thread
+            if thread is not None:
+                deadline = time.monotonic() + SHUTDOWN_TIMEOUT_SECONDS
+                while thread.is_alive():
+                    self.raise_ffn_loop_error_if_any()
+                    remaining = deadline - time.monotonic()
+                    if remaining <= 0:
+                        raise RuntimeError(
+                            "Async graph did not stop; retain live resources"
+                        )
+                    thread.join(timeout=min(POLL_SECONDS, remaining))
+            self.raise_ffn_loop_error_if_any()
+            self.model_runner.shutdown()
+            if event is not None:
+                event.set()
+            self._ffn_thread = None
+            self._ffn_shutdown_event = None
+            return
         if event is not None:
             event.set()
 

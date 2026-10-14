@@ -20,6 +20,8 @@
 #include "afd_async_combine_send/op_api/aclnn_afd_async_combine_send.h"
 #include "afd_async_dispatch_recv/op_api/aclnn_afd_async_dispatch_recv.h"
 #include "afd_async_dispatch_send/op_api/aclnn_afd_async_dispatch_send.h"
+#include "afd_async_dispatch_recv_controlled/op_api/aclnn_afd_async_dispatch_recv_controlled.h"
+#include "utils/op_kernel/cam_ffn_status.h"
 
 namespace afd_plugin::cam_async {
 namespace {
@@ -272,9 +274,57 @@ at::Tensor combine_recv(
   return output;
 }
 
+void check_graph_available() {
+  TORCH_CHECK(
+      GetOpApiFuncAddr("aclnnAfdAsyncDispatchRecvControlledGetWorkspaceSize") != nullptr &&
+      GetOpApiFuncAddr("aclnnAfdAsyncDispatchRecvControlled") != nullptr,
+      "Async FFN graph requires matching AFD extension, host library and kernel package");
+}
+
+template <bool EXECUTE_NPU>
+std::vector<at::Tensor> dispatch_recv_controlled(
+    const at::Tensor &x, const at::Tensor &comm_args, const int64_t comm_id,
+    const int64_t max_seq_len, const int64_t hidden_size, const int64_t top_k,
+    const int64_t moe_rank_num, const int64_t attn_rank_num,
+    const int64_t route_expert_num_per_moe, const int64_t moe_rank_id,
+    const int64_t world_size, const int64_t tp_size,
+    const int64_t dynamic_quant, c10::string_view group_name,
+    const at::Tensor &stop, const at::Tensor &valid_layers) {
+  auto outputs = dispatch_recv<false>(x, comm_args, comm_id, max_seq_len,
+      hidden_size, top_k, moe_rank_num, attn_rank_num, route_expert_num_per_moe,
+      moe_rank_id, world_size, tp_size, dynamic_quant, group_name);
+  check_tensor(stop, x, "stop");
+  TORCH_CHECK(stop.scalar_type() == at::kLong && stop.dim() == 1 &&
+                  stop.numel() == AfdCam::CONTROL_WORDS,
+              "stop control must be int64[2]: host STOP, device first ERROR");
+  auto slot = at::empty({1}, x.options().dtype(at::kLong));
+  check_tensor(valid_layers, x, "valid_layers");
+  TORCH_CHECK(valid_layers.scalar_type() == at::kLong && valid_layers.dim() == 1 &&
+                  valid_layers.numel() > 0, "valid_layers must be a nonempty int64 vector");
+  TORCH_CHECK(max_seq_len / tp_size <= AfdCam::TOKEN_OFFSET_LIMIT,
+              "per-rank token capacity exceeds uint16 CAM offsets");
+  if constexpr (EXECUTE_NPU) {
+    std::string group(group_name.data(), group_name.size());
+    char *group_ptr = group.data();
+    EXEC_NPU_CMD(aclnnAfdAsyncDispatchRecvControlled, x, comm_args,
+        stop, valid_layers, RESERVED_MAGIC, max_seq_len, hidden_size,
+        top_k, moe_rank_num, attn_rank_num, route_expert_num_per_moe,
+        moe_rank_id, world_size, tp_size, dynamic_quant, group_ptr,
+        outputs[0], outputs[1], outputs[2], outputs[3], slot);
+  }
+  outputs.push_back(slot);
+  return outputs;
+}
+
 }  // namespace afd_plugin::cam_async
 
 TORCH_LIBRARY_FRAGMENT(afd_ascend, ops) {
+  ops.def("check_cam_ffn_graph_available() -> ()", &afd_plugin::cam_async::check_graph_available);
+  ops.def("afd_async_dispatch_recv_controlled(Tensor x, Tensor comm_args, "
+          "int comm_id, int max_seq_len, int hidden_size, int top_k, "
+          "int moe_rank_num, int attn_rank_num, int route_expert_num_per_moe, "
+          "int moe_rank_id, int world_size, int tp_size, int dynamic_quant, "
+          "str group_name, Tensor(a!) stop, Tensor valid_layers) -> Tensor[]");
   ops.def("afd_async_dispatch_send(Tensor x, Tensor expert_ids, Tensor comm_args, "
           "int comm_id, int max_seq_len, int batch_size, int hidden_size, int top_k, "
           "int moe_rank_num, int attn_rank_num, int route_expert_num_per_moe, "
@@ -297,6 +347,7 @@ TORCH_LIBRARY_FRAGMENT(afd_ascend, ops) {
 }
 
 TORCH_LIBRARY_IMPL(afd_ascend, PrivateUse1, ops) {
+  ops.impl("afd_async_dispatch_recv_controlled", &afd_plugin::cam_async::dispatch_recv_controlled<true>);
   ops.impl("afd_async_dispatch_send", &afd_plugin::cam_async::dispatch_send<true>);
   ops.impl("afd_async_dispatch_recv", &afd_plugin::cam_async::dispatch_recv<true>);
   ops.impl("afd_async_combine_send", &afd_plugin::cam_async::combine_send<true>);
@@ -305,6 +356,7 @@ TORCH_LIBRARY_IMPL(afd_ascend, PrivateUse1, ops) {
 
 // Explicitly enforce the inference-only contract, including when grad mode is on.
 TORCH_LIBRARY_IMPL(afd_ascend, AutogradPrivateUse1, ops) {
+  ops.impl("afd_async_dispatch_recv_controlled", &afd_plugin::cam_async::dispatch_recv_controlled<true>);
   ops.impl("afd_async_dispatch_send", &afd_plugin::cam_async::dispatch_send<true>);
   ops.impl("afd_async_dispatch_recv", &afd_plugin::cam_async::dispatch_recv<true>);
   ops.impl("afd_async_combine_send", &afd_plugin::cam_async::combine_send<true>);
@@ -312,6 +364,7 @@ TORCH_LIBRARY_IMPL(afd_ascend, AutogradPrivateUse1, ops) {
 }
 
 TORCH_LIBRARY_IMPL(afd_ascend, Meta, ops) {
+  ops.impl("afd_async_dispatch_recv_controlled", &afd_plugin::cam_async::dispatch_recv_controlled<false>);
   ops.impl("afd_async_dispatch_send", &afd_plugin::cam_async::dispatch_send<false>);
   ops.impl("afd_async_dispatch_recv", &afd_plugin::cam_async::dispatch_recv<false>);
   ops.impl("afd_async_combine_send", &afd_plugin::cam_async::combine_send<false>);

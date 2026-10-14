@@ -6,6 +6,7 @@ from __future__ import annotations
 
 import importlib
 import logging
+import queue
 import sys
 import types
 from enum import IntEnum
@@ -265,6 +266,7 @@ def _config(role: str, *, async_dp: bool = False):
 
     return SimpleNamespace(
         additional_config={"afd": afd_config},
+        use_v2_model_runner=False,
         parallel_config=parallel_config,
         device_config=SimpleNamespace(device_type="cuda"),
         scheduler_config=scheduler_config,
@@ -533,7 +535,8 @@ def test_async_attention_loop_publishes_counts_via_upstream_hook(monkeypatch):
     assert all(stats.kv_cache_usage == 0.0 for stats in published_stats)
 
 
-def test_engine_core_patch_runs_and_stops_ffn_loop(monkeypatch):
+@pytest.mark.parametrize("async_dp", [False, True])
+def test_engine_core_patch_runs_and_stops_ffn_loop(monkeypatch, async_dp):
     core_module = _install_fake_vllm_core(monkeypatch)
     _load_patch_module()
 
@@ -547,7 +550,9 @@ def test_engine_core_patch_runs_and_stops_ffn_loop(monkeypatch):
         def shutdown(self):
             self.calls.append("shutdown")
 
-    engine = core_module.EngineCoreProc(_config("ffn"), Executor, log_stats=True)
+    engine = core_module.EngineCoreProc(
+        _config("ffn", async_dp=async_dp), Executor, log_stats=True
+    )
     engine.shutdown_state = _EngineShutdownState.RUNNING
 
     from afd_plugin.compat.patches import engine_core as engine_core_patch
@@ -639,3 +644,47 @@ def test_engine_core_ffn_start_rpc_failure_emits_no_readiness_log(monkeypatch, c
         engine.run_busy_loop()
 
     assert "AFD FFN EngineCore started; workers run connector loop." not in caplog.text
+
+
+@pytest.mark.parametrize("message", ["utility", "wakeup", "failure", "generation"])
+def test_async_ffn_daemon_services_control_without_scheduler(monkeypatch, message):
+    core_module = _install_fake_vllm_core(monkeypatch)
+    _load_patch_module()
+    core_module.EngineCoreRequestType = SimpleNamespace(
+        UTILITY="utility", EXECUTOR_FAILED="failure", WAKEUP="wakeup"
+    )
+
+    class Executor:
+        def __init__(self, config):
+            self.calls = []
+
+        def collective_rpc(self, method):
+            self.calls.append(method)
+
+    config = _config("ffn", async_dp=True)
+    config.use_v2_model_runner = True
+    engine = core_module.EngineCoreProc(config, Executor, log_stats=False)
+    assert engine._pooler_config_logged is False
+    engine.shutdown_state = _EngineShutdownState.RUNNING
+    engine.input_queue = queue.Queue()
+    engine.input_queue.put((message, "get_supported_tasks"))
+    handled = []
+
+    def handle(kind, payload):
+        handled.append((kind, payload))
+        if kind == "failure":
+            raise RuntimeError("Executor failed")
+        engine.shutdown_state = _EngineShutdownState.REQUESTED
+
+    engine._handle_client_request = handle
+    expected = RuntimeError if message in ("failure", "generation") else SystemExit
+    with pytest.raises(expected):
+        engine.run_busy_loop()
+    assert handled == (
+        [] if message == "generation" else [(message, "get_supported_tasks")]
+    )
+    assert engine.model_executor.calls == [
+        "start_ffn_server_loop",
+        "raise_ffn_loop_error_if_any",
+        "stop_ffn_server_loop",
+    ]

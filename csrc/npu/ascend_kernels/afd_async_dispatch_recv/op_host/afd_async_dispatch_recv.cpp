@@ -8,6 +8,7 @@
  * 2025-12-18 create AfdAsyncDispatchRecv tiling function file
  */
 #include "register/op_def_registry.h"
+#include "afd_async_dispatch_recv.h"
 #include "tiling/platform/platform_ascendc.h"
 #include "tiling/hccl/hccl_tiling.h"
 #include "../op_kernel/afd_async_dispatch_recv_tiling.h"
@@ -279,9 +280,7 @@ static ge::graphStatus InferDataType(gert::InferDataTypeContext *context)
 }
 
 namespace ops {
-class AfdAsyncDispatchRecv : public OpDef {
-public:
-    explicit AfdAsyncDispatchRecv(const char* name) : OpDef(name)
+AfdAsyncDispatchRecv::AfdAsyncDispatchRecv(const char* name) : OpDef(name)
     {
         this->Input("x")
             .ParamType(REQUIRED)
@@ -337,8 +336,15 @@ public:
 
         this->AICore().SetTiling(optiling::TilingFunc);
     }
-};
 
 OP_ADD(AfdAsyncDispatchRecv);
 
 } // namespace ops
+
+namespace optiling {
+ge::graphStatus GraphDispatchRecvTiling(gert::TilingContext *context) { return TilingFunc(context); }
+}
+namespace ge {
+graphStatus GraphDispatchRecvShape(gert::InferShapeContext *context) { return InferShape(context); }
+graphStatus GraphDispatchRecvDtype(gert::InferDataTypeContext *context) { return InferDataType(context); }
+}

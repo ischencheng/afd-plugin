@@ -276,6 +276,7 @@ def _run_select_ops(*args: str) -> subprocess.CompletedProcess[str]:
                 "afd_async_combine_recv",
                 "grouped_matmul_swiglu_quant_v2_layered",
                 "grouped_matmul_layered",
+                "afd_async_dispatch_recv_controlled",
             ],
         ),
         ("ascend950", ["a2e", "e2a"]),
@@ -321,3 +322,19 @@ def test_select_ops_drops_shmem_operators_when_shmem_missing():
 
     assert select_ops.resolve(registry, ["a2e", "e2a"], False, None) == ["e2a"]
     assert select_ops.resolve(registry, ["a2e", "e2a"], True, None) == ["a2e", "e2a"]
+
+
+def test_graph_dr_selective_build_includes_original_host_definitions():
+    result = _run_select_ops(
+        "--soc",
+        "ascend910_93",
+        "--shmem",
+        "0",
+        "--ops",
+        "afd_async_dispatch_recv_controlled",
+    )
+    assert result.returncode == 0, result.stderr
+    assert result.stdout.split() == [
+        "afd_async_dispatch_recv",
+        "afd_async_dispatch_recv_controlled",
+    ]

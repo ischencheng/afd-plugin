@@ -364,6 +364,10 @@ __global__ __aicore__ void grouped_matmul_layered(GM_ADDR x, GM_ADDR weight, GM_
     // layered: consume layer_index at Init stage (one 8B GM read per core); all_weight/all_bias/
     // all_scale are per-layer full-expert tensor lists resolved through this index.
     int64_t curLayer = LayeredReadLayerIndex(layerIndex);
+    // Match W13: a terminal controlled receive must never compute layer zero.
+    if (curLayer < 0) {
+        return;
+    }
 
 #if (defined(__CCE_AICORE__) && __CCE_AICORE__ == 220) || (defined(__NPU_ARCH__) && (__NPU_ARCH__ == 3003 || __NPU_ARCH__ == 3113))
 #if defined(GMM_ANTI_QUANT_A8W4_MSD)

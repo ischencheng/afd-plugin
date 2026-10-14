@@ -2,7 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the AFD plugin project
 """Ascend CAM asynchronous connector for Attention/FFN disaggregation.
 
-``CAMAsyncAFDConnector`` is the eager-only Ascend inference data path.
+``CAMAsyncAFDConnector`` supports eager Attention and eager or FULL FFN.
 Attention ranks run MoE routing, submit activations with CAM async
 dispatch-send, and receive combined expert output with combine-recv. FFN ranks
 receive routed-expert activations with dispatch-recv, execute their
@@ -15,23 +15,27 @@ synchronous connectors, CAM async carries routing and token-count metadata in
 the CAM operator payload and does not create a separate Gloo DP-metadata
 control plane.
 
-The supported deployment requires ``async=true``, eager execution, Ascend CAM
+The supported deployment requires ``async=true``, Ascend CAM
 operator packages, and matching topology/configuration on every rank. Regular
 prefill and autoregressive decode steps use the same connector. Attention
-microbatching uses the native DBO runtime with Ascend adaptations; ACL graph
-execution is not supported. Legacy Async microbatching flags are configuration
-aliases, and no independent Async split or model schedule is maintained. See
-``docs/npu/CAM_ASYNC_CONNECTOR_USER_GUIDE.md`` for configuration, rank
+microbatching uses the native DBO runtime with Ascend adaptations. FFN FULL
+requires MRV2 and DBO-off on every rank. Legacy Async microbatching flags are
+configuration aliases, and no independent Async split or model schedule is
+maintained. See ``docs/npu/CAM_ASYNC_CONNECTOR_USER_GUIDE.md`` for configuration, rank
 derivation, launch guidance, and the full limitations.
 """
 
 from __future__ import annotations
 
+import json
 import os
+import threading
+import time
+import uuid
 from collections.abc import Mapping
-from dataclasses import dataclass
+from dataclasses import asdict, dataclass
 from datetime import timedelta
-from typing import TYPE_CHECKING, Any, Final, cast
+from typing import TYPE_CHECKING, Any, Final, Literal, cast
 
 import torch
 from torch import Tensor
@@ -61,14 +65,18 @@ from afd_plugin.distributed import (
     create_hccl_process_group_options,
     init_afd_process_group,
 )
+from afd_plugin.validation import cam_receive_capacity, validate_graph_capacity
 
 if TYPE_CHECKING:
+    from torch.distributed import Store
     from torch.distributed.distributed_c10d import ProcessGroup
     from vllm.config import VllmConfig
     from vllm.model_executor.layers.fused_moe import FusedMoERouter
 
 AFD_ASYNC_CAM_GROUP_NAME = "afd_async_cam"
 CAM_COMM_ID = 0
+SHUTDOWN_TIMEOUT_SECONDS = 30.0
+POLL_SECONDS = 0.02
 ATTN_RANKS_PER_DP_CONFIG_KEY = "attn_ranks_per_dp"
 ASYNC_MOE_NUM_STAGES = 2
 ASYNC_MOE_REQUEST_SPLIT = "request"
@@ -82,10 +90,42 @@ _AFD_ASYNC_EXTRA_CONFIG_FIELDS: Final[frozenset[str]] = frozenset(
         "async_moe_num_ubatches",
         "async_moe_split",
         "hccl_buffer_size",
+        "ffn_graph_allow_eager_fallback",
     },
 )
 
 logger = init_logger(__name__)
+
+
+@dataclass(frozen=True)
+class FFNGraphPlan:
+    requested: Literal["eager", "full"] = "eager"
+    allow_eager_fallback: bool = False
+    graph_error: str = ""
+    signature: str = ""
+    layer_ids: tuple[int, ...] = ()
+
+
+def resolve_ffn_mode(plans: list[FFNGraphPlan]) -> tuple[str, str]:
+    if not plans or len({plan.requested for plan in plans}) != 1:
+        raise ValueError("All FFN ranks must request the same execution mode")
+    if plans[0].requested == "eager":
+        return "eager", ""
+    if plans[0].requested != "full":
+        raise ValueError("Unknown Async FFN execution mode")
+    errors = [plan.graph_error for plan in plans if plan.graph_error]
+    if len({plan.signature for plan in plans if not plan.graph_error}) > 1:
+        errors.append("FFN graph signatures differ across ranks")
+    if errors:
+        reason = "; ".join(dict.fromkeys(errors))
+        if not all(plan.allow_eager_fallback for plan in plans):
+            raise ValueError(f"Async FFN FULL is unsupported: {reason}")
+        return "eager", reason
+    if not plans[0].signature or not plans[0].layer_ids:
+        raise ValueError("Async FFN FULL requires a loaded executor signature")
+    if len({plan.layer_ids for plan in plans}) != 1:
+        raise ValueError("Async FFN layer tables differ across ranks")
+    return "full", ""
 
 
 def select_cam_experts(
@@ -156,6 +196,7 @@ class AFDAsyncExtraInfo(ConnectorExtraInfo):
     async_moe_num_ubatches: int = ASYNC_MOE_NUM_STAGES
     async_moe_split: str = ASYNC_MOE_REQUEST_SPLIT
     hccl_buffer_size: int | None = None
+    ffn_graph_allow_eager_fallback: bool = False
 
     @classmethod
     def from_mapping(cls, raw: Mapping[str, Any] | None) -> AFDAsyncExtraInfo:
@@ -202,6 +243,10 @@ class AFDAsyncExtraInfo(ConnectorExtraInfo):
                 raw.get("async_moe_split", ASYNC_MOE_REQUEST_SPLIT),
                 field_name="async_moe_split",
             ),
+            ffn_graph_allow_eager_fallback=coerce_extra_bool(
+                raw.get("ffn_graph_allow_eager_fallback", False),
+                field_name="ffn_graph_allow_eager_fallback",
+            ),
             hccl_buffer_size=coerce_optional_extra_positive_int(
                 raw.get("hccl_buffer_size"),
                 field_name="hccl_buffer_size",
@@ -215,6 +260,7 @@ class AFDAsyncExtraInfo(ConnectorExtraInfo):
             "async_moe_ubatching": self.async_moe_ubatching,
             "async_moe_num_ubatches": self.async_moe_num_ubatches,
             "async_moe_split": self.async_moe_split,
+            "ffn_graph_allow_eager_fallback": self.ffn_graph_allow_eager_fallback,
         }
         if self.hccl_buffer_size is not None:
             result["hccl_buffer_size"] = self.hccl_buffer_size
@@ -232,6 +278,8 @@ class AFDAsyncTransferState(AFDTransferState):
     token_nums_rankid_layeridx: Tensor | None = None
     group_list: Tensor | None = None
     dynamic_scales: Tensor | None = None
+    layer_slot: Tensor | None = None
+    send_completion: Tensor | None = None
 
 
 @dataclass(slots=True)
@@ -275,6 +323,7 @@ class CAMAsyncAFDConnector(AFDConnectorBase):
     """
 
     control_plane = None
+    extra_info: AFDAsyncExtraInfo
 
     @classmethod
     def parse_extra_config(
@@ -332,6 +381,19 @@ class CAMAsyncAFDConnector(AFDConnectorBase):
             int,
             list[tuple[AFDTransferContext, Tensor, Tensor]],
         ] = {}
+        self.ffn_graph_plan = FFNGraphPlan()
+        self._graph_store: Store | None = None
+        self._graph_prefix = ""
+        self.ffn_graph_mode = "eager"
+        self.ffn_graph_fallback_reason = ""
+        self._graph_warmup_layer_id: int | None = None
+        self._graph_attention_finished = False
+        self.graph_receiving = False
+        self._graph_stopped = False
+        self._graph_stop_requested = False
+        self._graph_stop_lock = threading.Lock()
+        self._graph_stop: Tensor | None = None
+        self._graph_layers: Tensor | None = None
 
     @property
     def is_initialized(self) -> bool:
@@ -359,6 +421,7 @@ class CAMAsyncAFDConnector(AFDConnectorBase):
             pg_options=create_hccl_process_group_options(
                 self.hccl_buffer_size_mb,
             ),
+            store_callback=self._initialize_graph_startup,
         )
         backend = self.cam_pg._get_backend(torch.device("npu"))
         self.group_name = str(backend.get_hccl_comm_name(self.world_rank))
@@ -370,9 +433,268 @@ class CAMAsyncAFDConnector(AFDConnectorBase):
             device=device,
         )
         self._initialized = True
+        if self.ffn_graph_mode == "full" and self.world_rank < self.attn_size:
+            self._run_attention_graph_startup()
+
+    def _initialize_graph_startup(self, store: Store) -> None:
+        self._graph_store = store
+        if self.world_rank == 0:
+            store.set("ffn_graph/nonce", uuid.uuid4().hex)
+        self._graph_prefix = f"ffn_graph/{store.get('ffn_graph/nonce').decode()}/"
+        signature = repr(
+            (
+                self.attn_size,
+                self.ffn_size,
+                self.hidden_size,
+                self.topk,
+                self.num_routed_experts,
+                str(self.activation_dtype),
+                self.dynamic_quant,
+                self.tp_size,
+                self.max_num_batched_tokens,
+            )
+        )
+        self._negotiate_graph(
+            self.ffn_graph_plan if self.world_rank >= self.attn_size else None,
+            signature,
+        )
+        if self.ffn_graph_mode == "full":
+            try:
+                parallel = self.vllm_config.parallel_config
+                if not self.vllm_config.use_v2_model_runner:
+                    raise ValueError("Async FFN FULL requires MRV2 on every rank")
+                if (
+                    parallel.enable_dbo
+                    or parallel.use_ubatching
+                    or self.extra_info.async_moe_ubatching
+                ):
+                    raise ValueError(
+                        "Async FFN FULL requires DBO disabled on every rank"
+                    )
+                validate_graph_capacity(
+                    self.max_num_batched_tokens, self.tp_size, cam_receive_capacity()
+                )
+                self.graph_phase("validated")
+            except Exception as exc:
+                self.fail_graph_startup(exc)
+                raise
+
+    def _graph_keys(self, stage: str, ranks: range) -> list[str]:
+        return [f"{self._graph_prefix}{stage}/{rank}" for rank in ranks]
+
+    def _graph_publish(self, stage: str, value: str = "ready") -> None:
+        assert self._graph_store is not None
+        self._graph_store.set(f"{self._graph_prefix}{stage}/{self.world_rank}", value)
+
+    def check_graph_failure(self) -> None:
+        assert self._graph_store is not None
+        for key in self._graph_keys("error", range(self.topology.world_size)):
+            if self._graph_store.check([key]):
+                raise RuntimeError(self._graph_store.get(key).decode())
+
+    def fail_graph_startup(self, error: Exception) -> None:
+        self._graph_publish("error", str(error))
+
+    def _graph_wait(self, keys: list[str]) -> None:
+        assert self._graph_store is not None
+        deadline = time.monotonic() + SHUTDOWN_TIMEOUT_SECONDS
+        while True:
+            self.check_graph_failure()
+            if self._graph_store.check(keys):
+                return
+            if time.monotonic() >= deadline:
+                raise TimeoutError(
+                    "Async FFN graph handshake timed out; retain resources"
+                )
+            time.sleep(POLL_SECONDS)
+
+    def wait_graph_device(self, event: torch.npu.Event) -> None:
+        deadline = time.monotonic() + SHUTDOWN_TIMEOUT_SECONDS
+        while not event.query():
+            self.check_graph_failure()
+            if time.monotonic() >= deadline:
+                raise TimeoutError("Async graph warmup timed out; retain resources")
+            time.sleep(POLL_SECONDS)
+
+    def graph_phase(self, stage: str) -> None:
+        self._graph_publish(stage)
+        self._graph_wait(self._graph_keys(stage, range(self.topology.world_size)))
+
+    def _negotiate_graph(
+        self, plan: FFNGraphPlan | None, transport_signature: str
+    ) -> None:
+        assert self._graph_store is not None
+        self._graph_publish(
+            "plan",
+            json.dumps(
+                {
+                    "transport": transport_signature,
+                    "ffn": asdict(plan) if plan else None,
+                }
+            ),
+        )
+        keys = self._graph_keys("plan", range(self.topology.world_size))
+        self._graph_wait(keys)
+        try:
+            entries = [json.loads(self._graph_store.get(key)) for key in keys]
+            plans = []
+            for entry in entries[self.attn_size :]:
+                fields = entry["ffn"]
+                fields["layer_ids"] = tuple(fields["layer_ids"])
+                plans.append(FFNGraphPlan(**fields))
+            self.ffn_graph_mode, self.ffn_graph_fallback_reason = resolve_ffn_mode(
+                plans
+            )
+            if (
+                plans[0].requested == "full"
+                and len({entry["transport"] for entry in entries}) != 1
+            ):
+                raise ValueError("Async CAM graph transport signatures differ")
+            if self.ffn_graph_mode == "full":
+                self._graph_warmup_layer_id = plans[0].layer_ids[0]
+        except Exception as exc:
+            self.fail_graph_startup(exc)
+            raise
+
+    def graph_service_ready(self) -> None:
+        self._graph_publish("service")
+
+    def _wait_graph_service_ready(self) -> None:
+        self._graph_wait(
+            self._graph_keys("service", range(self.attn_size, self.topology.world_size))
+        )
+
+    def _all_attention_drained(self) -> bool:
+        assert self._graph_store is not None
+        self.check_graph_failure()
+        return self._graph_store.check(
+            self._graph_keys("drained", range(self.attn_size))
+        )
+
+    def _graph_ffn_stopped(self) -> None:
+        # The F service loop's final Store access. Stop RPCs only join it.
+        self._graph_publish("stopped")
+
+    def _finish_attention_graph_shutdown(self) -> None:
+        if self._graph_attention_finished:
+            return
+        self._graph_publish("drained")
+        self._graph_wait(
+            self._graph_keys("stopped", range(self.attn_size, self.topology.world_size))
+        )
+        self._graph_publish("finished")
+        if self.world_rank == 0:
+            self._graph_wait(self._graph_keys("finished", range(self.attn_size)))
+        self._graph_attention_finished = True
+
+    def graph_startup_chunks(self) -> int:
+        """Every A TP rank sends one row to experts [0, topk)."""
+        local_experts = max(
+            0,
+            min(
+                self.expert_per_rank,
+                self.topk - (self.world_rank - self.attn_size) * self.expert_per_rank,
+            ),
+        )
+        experts_per_chunk = cam_receive_capacity() // self.tp_size
+        return max(1, (local_experts + experts_per_chunk - 1) // experts_per_chunk)
+
+    def _run_attention_graph_startup(self) -> None:
+        assert self._graph_warmup_layer_id is not None
+        device = torch.device(f"npu:{self.local_rank}")
+        hidden = torch.ones(
+            (1, self.hidden_size), dtype=self.activation_dtype, device=device
+        )
+        ids = torch.arange(self.topk, dtype=torch.int32, device=device).view(1, -1)
+        weights = torch.full((1, self.topk), 1 / self.topk, device=device)
+        reference = None
+        try:
+            # All A ranks enter the first MC2 operation concurrently. Waiting
+            # for one DP before submitting the others can deadlock cold init.
+            for phase in ("warmup", "self_check"):
+                if phase == "self_check":
+                    self.graph_phase("captured")
+                context = AFDTransferContext(
+                    AFDTransferMetadata(self._graph_warmup_layer_id, 0, [1])
+                )
+                self.send_attn_output(
+                    hidden, context, topk_ids=ids, topk_weights=weights
+                )
+                output = self.recv_ffn_output(hidden, context=context)
+                done = torch.npu.Event()
+                done.record()
+                self.wait_graph_device(done)
+                actual = output.cpu()
+                if phase == "warmup":
+                    reference = actual
+                elif not torch.equal(actual, reference):
+                    raise RuntimeError("Async graph startup differs from eager warmup")
+                self.graph_phase(phase)
+            self._wait_graph_service_ready()
+        except Exception as exc:
+            self.fail_graph_startup(exc)
+            raise
+
+    def prepare_graph(self) -> None:
+        device = torch.device(f"npu:{self.local_rank}")
+        # Host owns word 0 (STOP); DR owns word 1 (first error). Initialize once
+        # before capture so neither replay nor STOP can clear a prior error.
+        self._graph_stop = torch.zeros(2, dtype=torch.int64, device=device)
+        self._graph_layers = torch.tensor(
+            self.ffn_graph_plan.layer_ids, dtype=torch.int64, device=device
+        )
+        self._stop_host = torch.ones(1, dtype=torch.int64, pin_memory=True)
+        self._stop_stream = torch.npu.Stream(device=device)
+        self._stop_done = torch.npu.Event()
+        self.graph_receiving = True
+
+    def poll_graph_stop(self) -> None:
+        # Worker control RPCs poll drain independently of the blocked replay.
+        # Serialize STOP publication with terminal acknowledgement, so neither
+        # an unrecorded DMA event nor a Store access can outlive that ack.
+        with self._graph_stop_lock:
+            if self._graph_stop_requested or self._graph_stopped:
+                return
+            assert self._graph_store is not None and self._graph_stop is not None
+            if self._all_attention_drained():
+                with torch.npu.stream(self._stop_stream):
+                    self._graph_stop[:1].copy_(self._stop_host, non_blocking=True)
+                    self._stop_done.record(self._stop_stream)
+                self._graph_stop_requested = True
+
+    def finish_graph(self, slot: int) -> bool:
+        if slot >= 0:
+            return True
+        with self._graph_stop_lock:
+            if slot != -1 or not self._graph_stop_requested:
+                raise RuntimeError(
+                    f"Async graph DR failed with slot={slot}; retain resources"
+                )
+            self._stop_done.synchronize()
+            self._graph_ffn_stopped()
+            self._graph_stopped = True
+        return False
+
+    def quiesce_attention(self) -> None:
+        if (
+            self._graph_store is None
+            or self.ffn_graph_mode != "full"
+            or self.world_rank >= self.attn_size
+            or self._graph_attention_finished
+        ):
+            return
+        if self._pending_attention_payloads:
+            raise RuntimeError("Graph shutdown requires owners to consume pending CR")
+        # Called after the request engine stops admitting work. Fence all A
+        # streams once; do not add locks/events to every business DS/CR.
+        torch.npu.synchronize()
+        self._finish_attention_graph_shutdown()
 
     def close(self) -> None:
         """Destroy the HCCL process group and clear pending transfer states."""
+        self.quiesce_attention()
+        if self.graph_receiving and not self._graph_stopped:
+            raise RuntimeError("Cannot release Async graph before terminal completion")
         if self.cam_pg is not None:
             import torch.distributed as dist
 
@@ -381,6 +703,10 @@ class CAMAsyncAFDConnector(AFDConnectorBase):
         self.comm_args = None
         self._placeholder = None
         self._pending_attention_payloads.clear()
+        self._graph_stop = self._graph_layers = None
+        if self.graph_receiving:
+            del self._stop_host, self._stop_stream, self._stop_done
+            self.graph_receiving = False
         self._initialized = False
 
     def select_experts(self, **kwargs: Any) -> tuple[Tensor, Tensor]:
@@ -730,7 +1056,13 @@ class CAMAsyncAFDConnector(AFDConnectorBase):
             dynamic_quant=self.dynamic_quant,
             group_name=self.group_name,
         )
-        outputs = torch.ops.afd_ascend.afd_async_dispatch_recv(
+        receive = torch.ops.afd_ascend.afd_async_dispatch_recv
+        graph_args: tuple[Tensor, ...] = ()
+        if self.graph_receiving:
+            assert self._graph_stop is not None and self._graph_layers is not None
+            receive = torch.ops.afd_ascend.afd_async_dispatch_recv_controlled
+            graph_args = (self._graph_stop, self._graph_layers)
+        outputs = receive(
             placeholder,
             self.comm_args,
             self.comm_id,
@@ -745,8 +1077,11 @@ class CAMAsyncAFDConnector(AFDConnectorBase):
             self.tp_size,
             self.dynamic_quant,
             self.group_name,
+            *graph_args,
         )
-        hidden_states, dynamic_scales, batch_info, expert_token_nums = outputs
+        hidden_states, dynamic_scales, batch_info, expert_token_nums = outputs[:4]
+        if self.graph_receiving:
+            states.layer_slot = outputs[4]
         _log_cam_op_values(
             "async_dispatch_recv",
             "outputs",
@@ -804,7 +1139,7 @@ class CAMAsyncAFDConnector(AFDConnectorBase):
             tp_size=self.tp_size,
             group_name=self.group_name,
         )
-        torch.ops.afd_ascend.afd_async_combine_send(
+        states.send_completion = torch.ops.afd_ascend.afd_async_combine_send(
             ffn_output,
             self.comm_args,
             token_nums_rankid_layeridx,

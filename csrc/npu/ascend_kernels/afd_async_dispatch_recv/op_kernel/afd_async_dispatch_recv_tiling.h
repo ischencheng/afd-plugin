@@ -30,6 +30,7 @@ struct AfdAsyncDispatchRecvInfo {
     uint64_t totalWorkspaceSize;
     uint64_t maxTokenNum;
     int dynamicQuant;
+    uint32_t numLayers;
 };
 
 struct AfdAsyncDispatchRecvTilingData {
