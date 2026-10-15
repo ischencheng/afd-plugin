@@ -4,7 +4,6 @@
 
 from __future__ import annotations
 
-import time
 from typing import TYPE_CHECKING, Protocol, cast
 
 import torch
@@ -12,10 +11,7 @@ from vllm.logger import init_logger
 from vllm_ascend.utils import AscendDeviceType, get_ascend_device_type
 
 from afd_plugin.compat.npu.forward_context import ascend_forward_context
-from afd_plugin.compat.npu.ops import (
-    ensure_cam_async_ops_available,
-    ensure_cam_ffn_graph_available,
-)
+from afd_plugin.compat.npu.ops import ensure_cam_async_ops_available
 from afd_plugin.compat.npu.profiler import (
     create_afd_npu_profiler,
     step_afd_npu_profiler,
@@ -27,8 +23,6 @@ from afd_plugin.connectors.metadata import (
     AFDForwardContextMetadata,
 )
 from afd_plugin.connectors.npu.async_cam import (
-    POLL_SECONDS,
-    SHUTDOWN_TIMEOUT_SECONDS,
     AFDAsyncTransferState,
     CAMAsyncAFDConnector,
     FFNGraphPlan,
@@ -86,11 +80,11 @@ class AsyncNPUFFNModelRunner:
         self.effective_mode = "eager"
         self._graph: torch.npu.NPUGraph | None = None
         self._graph_capture_count = self._graph_replay_count = 0
-        self._graph_pending = self._graph_stopped = self._graph_closed = False
+        self._graph_pending = self._graph_closed = False
+        self._graph_receiver_exited = False
         self._graph_failure: Exception | None = None
         self._service_announced = self._is_shutdown = False
         self._failure: Exception | None = None
-        self.startup_replays = 0
         self.prof = create_afd_npu_profiler("ffn")
 
     def load_model(self) -> None:
@@ -150,14 +144,8 @@ class AsyncNPUFFNModelRunner:
             if executor is None
             else ""
         )
-        if self.requested_mode == "full":
-            try:
-                ensure_cam_ffn_graph_available()
-            except RuntimeError as exc:
-                graph_error = str(exc)
         self.connector.ffn_graph_plan = FFNGraphPlan(
             requested=self.requested_mode,
-            allow_eager_fallback=self.connector.extra_info.ffn_graph_allow_eager_fallback,
             graph_error=graph_error,
             signature=executor.graph_signature(cam_receive_capacity())
             if executor
@@ -178,35 +166,25 @@ class AsyncNPUFFNModelRunner:
                 done.record()
                 self.connector.wait_graph_device(done)
                 self.connector.graph_phase("warmup")
-                self.connector.prepare_graph()
                 stream = torch.npu.Stream(device=self.device)
                 stream.wait_stream(torch.npu.current_stream(self.device))
                 self._initialize_graph(stream)
                 self._capture_graph()
                 self.connector.graph_phase("captured")
-                for _ in range(chunks):
-                    self._submit_graph()
-                    if not self._complete_graph(SHUTDOWN_TIMEOUT_SECONDS):
-                        raise RuntimeError("Async graph stopped during self-check")
-                self.connector.graph_phase("self_check")
-                self.startup_replays = self._graph_replay_count
         except Exception as exc:
             self._failure = exc
             if self.connector._graph_store is not None:
                 self.connector.fail_graph_startup(exc)
             raise
         logger.info(
-            "Async FFN requested=%s mode=%s fallback=%s",
+            "Async FFN requested=%s mode=%s",
             self.requested_mode,
             self.effective_mode,
-            self.connector.ffn_graph_fallback_reason,
         )
 
     def _initialize_graph(self, stream: torch.npu.Stream) -> None:
         self._graph_stream = stream
         self._graph_pool = torch.npu.graph_pool_handle()
-        self._graph_done = torch.npu.Event()
-        self._graph_host_slot = torch.empty(1, dtype=torch.int64, pin_memory=True)
         self._graph_tensors: list[torch.Tensor] = []
 
     def _check_graph_live(self) -> None:
@@ -230,15 +208,15 @@ class AsyncNPUFFNModelRunner:
             ):
                 self._graph_payload = self.connector.recv_attn_output()
                 state = cast(AFDAsyncTransferState, self._graph_payload.context.states)
-                assert state.layer_slot is not None and state.group_list is not None
+                assert state.token_nums_rankid_layeridx is not None
+                assert state.group_list is not None
                 assert state.dynamic_scales is not None
-                self._graph_slot = state.layer_slot
-                self._graph_output = self._layered_executor.execute_graph(
+                self._graph_output = self._layered_executor(
                     self._graph_payload.hidden_states,
                     state.dynamic_scales,
                     state.group_list,
-                    self._graph_slot,
-                    self._graph_tensors,
+                    state.token_nums_rankid_layeridx,
+                    retained_tensors=self._graph_tensors,
                 )
                 self.connector.send_ffn_output(
                     self._graph_output, self._graph_payload.context
@@ -255,7 +233,7 @@ class AsyncNPUFFNModelRunner:
             self._graph is None
             or self._graph_capture_count != 1
             or self._graph_pending
-            or self._graph_stopped
+            or self._graph_receiver_exited
             or count < 1
         ):
             raise RuntimeError("Async FFN graph is not ready for replay")
@@ -265,57 +243,38 @@ class AsyncNPUFFNModelRunner:
                 for _ in range(count):
                     self._graph.replay()
                     self._graph_replay_count += 1
-                self._graph_host_slot.copy_(self._graph_slot, non_blocking=True)
-                self._graph_done.record(self._graph_stream)
         except Exception as exc:
             self._graph_failure = exc
             raise
 
-    def _complete_graph(self, timeout: float | None = None) -> bool:
+    def _complete_graph(self) -> bool:
         self._check_graph_live()
         if not self._graph_pending:
             raise RuntimeError("Async FFN has no pending replay")
-        deadline = None if timeout is None else time.monotonic() + timeout
         try:
-            if deadline is None:
-                # One fence for the batch; independent control RPCs send STOP
-                # when a partially filled batch is waiting for more work.
-                torch.npu.synchronize()
-            else:
-                # Startup self-check runs before the worker control loop exists.
-                while not self._graph_done.query():
-                    self.connector.poll_graph_stop()
-                    if time.monotonic() >= deadline:
-                        raise TimeoutError(
-                            "Async graph completion timed out; retain resources"
-                        )
-                    time.sleep(POLL_SECONDS)
-            # D2H is fenced; host observation never selects layer/count.
-            keep_running = self.connector.finish_graph(int(self._graph_host_slot[0]))
+            # One fence per bounded batch. The original DR cannot be cancelled;
+            # a blocked batch retains its graph, model and communication buffers.
+            torch.npu.synchronize()
         except Exception as exc:
             self._graph_failure = exc
             raise
         self._graph_pending = False
-        self._graph_stopped = not keep_running
-        return keep_running
+        return True
 
     def _close_graph(self) -> None:
         if self._graph_closed:
             return
         self._check_graph_live()
-        if self._graph_pending or not self._graph_stopped:
-            raise RuntimeError("Async graph resources require terminal completion")
+        if self._graph_pending or not self._graph_receiver_exited:
+            raise RuntimeError(
+                "Async graph resources require receiver exit and device completion"
+            )
         assert self._graph is not None
         self._graph.reset()
         self._graph = None
         self._graph_tensors.clear()
-        del self._graph_payload, self._graph_output, self._graph_slot
-        del (
-            self._graph_pool,
-            self._graph_done,
-            self._graph_host_slot,
-            self._graph_stream,
-        )
+        del self._graph_payload, self._graph_output
+        del self._graph_pool, self._graph_stream
         self._graph_closed = True
 
     def _initialize_layered_executor(self) -> None:

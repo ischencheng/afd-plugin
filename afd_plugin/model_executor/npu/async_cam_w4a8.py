@@ -175,40 +175,11 @@ class AsyncCAMW4A8Executor:
         dynamic_scales: torch.Tensor,
         group_list: torch.Tensor,
         batch_info: torch.Tensor,
-    ) -> torch.Tensor:
-        layer_index = batch_info[CAM_LAYER_INDEX : CAM_LAYER_INDEX + 1]
-        return self._execute(hidden_states, dynamic_scales, group_list, layer_index)
-
-    def execute_graph(
-        self,
-        hidden_states: torch.Tensor,
-        dynamic_scales: torch.Tensor,
-        group_list: torch.Tensor,
-        layer_slot: torch.Tensor,
-        retained_tensors: list[torch.Tensor],
-    ) -> torch.Tensor:
-        return self._execute(
-            hidden_states,
-            dynamic_scales,
-            group_list,
-            layer_slot,
-            validated_layer_slot=layer_slot,
-            retained_tensors=retained_tensors,
-        )
-
-    def _execute(
-        self,
-        hidden_states: torch.Tensor,
-        dynamic_scales: torch.Tensor,
-        group_list: torch.Tensor,
-        layer_index: torch.Tensor,
         *,
-        validated_layer_slot: torch.Tensor | None = None,
         retained_tensors: list[torch.Tensor] | None = None,
     ) -> torch.Tensor:
-        if validated_layer_slot is not None:
-            layer_index = validated_layer_slot
-        elif self.layer_id_to_slot is not None:
+        layer_index = batch_info[CAM_LAYER_INDEX : CAM_LAYER_INDEX + 1]
+        if self.layer_id_to_slot is not None:
             layer_index = self.layer_id_to_slot.index_select(0, layer_index)
         else:
             # The CANN tiling path checks the storage shape. A slice still

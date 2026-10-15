@@ -582,7 +582,6 @@ def _initialize_ffn_engine_core(
     self.vllm_config = vllm_config
     self.afd_config = afd_config
     self.log_stats = log_stats
-    self._pooler_config_logged = False
 
     with suppress(Exception):
         vllm_config.afd_config = afd_config
@@ -648,17 +647,7 @@ def _prepare_late_loaded_ffn_engine_core(
             scheduler_config.get_scheduler_cls = lambda: _AFDFFNNoopScheduler
 
 
-# vLLM 0.30 EngineCoreProc normally services utility requests in its scheduler
-# loop. MRV2 Async CAM replaces that loop, but its CLI needs capability/health
-# queries to finish startup and enter normal shutdown. Service control messages
-# here without invoking model scheduling. Remove this branch when vLLM exposes
-# a connector-daemon control loop; the synchronous FFN path stays unchanged.
 def _run_ffn_busy_loop(self, core_module: Any) -> None:
-    async_cam = (
-        self.afd_config.async_dp
-        and self.afd_config.connector == "CAMAsyncAFDConnector"
-        and self.vllm_config.use_v2_model_runner
-    )
     started = False
     try:
         self.model_executor.collective_rpc("start_ffn_server_loop")
@@ -670,22 +659,7 @@ def _run_ffn_busy_loop(self, core_module: Any) -> None:
         )
         while _is_running(self, core_module):
             self.model_executor.collective_rpc("raise_ffn_loop_error_if_any")
-            # ### PATCH START: Async CAM daemon control requests
-            if async_cam:
-                try:
-                    request_type, request = self.input_queue.get(timeout=0.5)
-                except queue.Empty:
-                    continue
-                if request_type not in (
-                    core_module.EngineCoreRequestType.UTILITY,
-                    core_module.EngineCoreRequestType.EXECUTOR_FAILED,
-                    core_module.EngineCoreRequestType.WAKEUP,
-                ):
-                    raise RuntimeError("Async FFN daemon accepts control requests only")
-                self._handle_client_request(request_type, request)
-            else:
-                time.sleep(0.5)
-            # ### PATCH END: Async CAM daemon control requests
+            time.sleep(0.5)
     except KeyboardInterrupt:
         core_module.logger.info(
             "AFD FFN EngineCore shutting down after KeyboardInterrupt"

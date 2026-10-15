@@ -16,7 +16,6 @@
 #include "afd_async_dispatch_recv_tiling.h"
 #include "cam_async_comm_args.h"
 #include "cam_async_comm_group.h"
-#include "cam_ffn_status.h"
 
 namespace MoeDistributeDispatchImpl {
 constexpr uint64_t CAM_MAX_RANK_SIZE = 384;  // max NPUs supported by the Cam comm library
@@ -56,14 +55,6 @@ public:
                                 const AfdAsyncDispatchRecvTilingData *tilingData,
                                 GM_ADDR commArgs, int32_t isCamComm);
     __aicore__ inline void Process();
-    __aicore__ inline void SetGraph(GM_ADDR stop, GM_ADDR layers, GM_ADDR slot, uint32_t numLayers)
-    {
-        graph_ = true;
-        stopGM_.SetGlobalBuffer((__gm__ int64_t *)stop);
-        layersGM_.SetGlobalBuffer((__gm__ int64_t *)layers);
-        slotGM_.SetGlobalBuffer((__gm__ int64_t *)slot);
-        numLayers_ = numLayers;
-    }
 
 private:
     __aicore__ inline uint32_t MathCeil(uint32_t n, uint32_t align)
@@ -86,8 +77,6 @@ private:
                                                uint32_t startExpert, uint32_t endExpert);
 
     __aicore__ inline uint32_t WaitFromAttn();
-    __aicore__ inline uint32_t WaitGraph();
-    __aicore__ inline void FinishGraph(int64_t slot);
 
     __aicore__ inline void ClearFlags(uint32_t attnRankId);
 
@@ -135,11 +124,6 @@ private:
     uint32_t hiddenSizeQuant_{0};
 
     bool isError_{false};
-    bool graph_{false};
-    uint32_t numLayers_{0};
-    GlobalTensor<int64_t> stopGM_, layersGM_, slotGM_;
-    LocalTensor<int64_t> decision_;
-    int64_t slot_{AfdCam::STOP};
 };
 
 template <TemplateMC2TypeClass>
@@ -193,10 +177,6 @@ __aicore__ inline void AfdAsyncDispatchRecv<TemplateMC2TypeFunc>::Init(
 
     uint64_t bufOffset = 0;
     uint64_t bufSize;
-    if (graph_) {
-        decision_ = ubBuffer_.GetWithOffset<int64_t>(UB_ALIGN / sizeof(int64_t), bufOffset);
-        bufOffset += UB_ALIGN;
-    }
 
     bufSize = MathCeil(sizeof(int64_t) * BATCH_INFO_VAL_NUM, UB_ALIGN); // 32 B
     batchInfoTensor_ = ubBuffer_.GetWithOffset<int64_t>(bufSize / sizeof(int64_t), bufOffset);
@@ -253,7 +233,6 @@ template <TemplateMC2TypeClass>
 __aicore__ inline void AfdAsyncDispatchRecv<TemplateMC2TypeFunc>::Process()
 {
     if (isError_ == true) {
-        if (graph_) { FinishGraph(AfdCam::INSUFFICIENT_UB); }
         return;
     }
 
@@ -263,11 +242,7 @@ __aicore__ inline void AfdAsyncDispatchRecv<TemplateMC2TypeFunc>::Process()
 template <TemplateMC2TypeClass>
 __aicore__ inline void AfdAsyncDispatchRecv<TemplateMC2TypeFunc>::DispatchRecv()
 {
-    uint32_t tpAttnRankId = graph_ ? WaitGraph() : WaitFromAttn();
-    if (graph_ && slot_ < 0) {
-        FinishGraph(slot_);
-        return;
-    }
+    uint32_t tpAttnRankId = WaitFromAttn();
 
     tpBatchInfoTensor_(ATTN_RANK_ID_INDEX) = tpAttnRankId;  // attnRankId
     tpBatchInfoTensor_(LAYER_INDEX_INDEX) = batchInfoTensor_(LAYER_INDEX_INDEX);  // layerIndex
@@ -327,12 +302,7 @@ __aicore__ inline void AfdAsyncDispatchRecv<TemplateMC2TypeFunc>::DispatchRecv()
     // All AIVs see the same counts/flags. Do not treat an unselected chunk as
     // expert 0, read an invalid expert, or publish a completion for missing data.
     if (!foundExpert) {
-        if (graph_) { FinishGraph(AfdCam::CAPACITY_EXCEEDED); }
         isError_ = true;
-        return;
-    }
-    if (graph_ && (tokenCnt + aivNum_ - 1) / aivNum_ > ubReuseSize_ / sizeof(uint16_t)) {
-        FinishGraph(AfdCam::INSUFFICIENT_UB);
         return;
     }
     SyncAll<true>();
@@ -524,115 +494,6 @@ __aicore__ inline void AfdAsyncDispatchRecv<TemplateMC2TypeFunc>::DispatchRecvRo
     for (uint32_t i = startExpert; i <= endExpert; ++i) {
         tpExpertRecvTokenNumTensor_(expertNumPerMoe_ + i) += expertRecvTokenNumTensor_(i);
     }
-}
-
-// AIV0 selects once and publishes into local outputs, never into CAM's wire
-// header. Both barriers are required: every AIV must read the same decision
-// before any AIV can advance to the next phase or overwrite an output.
-template <TemplateMC2TypeClass>
-__aicore__ inline uint32_t AfdAsyncDispatchRecv<TemplateMC2TypeFunc>::WaitGraph()
-{
-    GM_ADDR dstGM = GetPeerAddrByRankId(moeRankId_);
-    if (aivId_ == 0) {
-        GlobalTensor<int64_t> header;
-        header.SetGlobalBuffer((__gm__ int64_t *)(dstGM + totalWorkspaceSize_ - UB_ALIGN));
-        DataCopy(batchInfoTensor_, header, UB_ALIGN / sizeof(int64_t));
-        SyncFunc<HardEvent::MTE2_S>();
-        const uint32_t next = batchInfoTensor_(0);
-        SyncFunc<HardEvent::S_MTE2>();
-        bool selected = false;
-        while (!selected) {
-            DataCopyPad(decision_, stopGM_,
-                {1U, AfdCam::CONTROL_WORDS * sizeof(int64_t), 0U, 0U, 0U}, {false, 0U, 0U, 0U});
-            SyncFunc<HardEvent::MTE2_S>();
-            const bool stop = decision_(0) == AfdCam::REQUEST_STOP;
-            const int64_t error = decision_(AfdCam::ERROR_WORD);
-            SyncFunc<HardEvent::S_MTE2>();
-            if (error < AfdCam::STOP || stop) {
-                slot_ = error < AfdCam::STOP ? error : AfdCam::STOP;
-                break;
-            }
-            for (uint32_t group = 0; group < attnRankNum_ / tpSize_; ++group) {
-                const uint32_t source = (next + group * tpSize_) % attnRankNum_;
-                bool ready = true;
-                // Visit the first TP rank last, leaving its original header.
-                for (uint32_t peer = tpSize_; peer > 0; --peer) {
-                    header.SetGlobalBuffer((__gm__ int64_t *)(dstGM + workspaceSizePerAttn_ * (source + peer - 1)));
-                    DataCopyPad(batchInfoTensor_, header,
-                        {1U, sizeof(int64_t) * BATCH_INFO_VAL_NUM, 0U, 0U, 0U}, {false, 0U, 0U, 0U});
-                    SyncFunc<HardEvent::MTE2_S>();
-                    SyncFunc<HardEvent::S_MTE2>();
-                    if (batchInfoTensor_(TOKEN_NUM_INDEX) == 0) { ready = false; break; }
-                }
-                if (!ready) { continue; }
-                slot_ = AfdCam::INVALID_LAYER;
-                for (uint32_t i = 0; i < numLayers_; ++i) {
-                    if (layersGM_.GetValue(i) == batchInfoTensor_(LAYER_INDEX_INDEX)) {
-                        slot_ = i;
-                        break;
-                    }
-                }
-                selected = true;
-                SyncFunc<HardEvent::S_MTE3>();
-                DataCopyPad(batchInfoGMTensor_, batchInfoTensor_,
-                    {1U, sizeof(int64_t) * BATCH_INFO_VAL_NUM, 0U, 0U, 0U});
-                SyncFunc<HardEvent::MTE3_S>();
-                break;
-            }
-        }
-        decision_(0) = slot_;
-        SyncFunc<HardEvent::S_MTE3>();
-        DataCopyPad(slotGM_, decision_, {1U, sizeof(int64_t), 0U, 0U, 0U});
-        SyncFunc<HardEvent::MTE3_S>();
-    }
-    SyncAll<true>();
-    DataCopyPad(decision_, slotGM_, {1U, sizeof(int64_t), 0U, 0U, 0U}, {false, 0U, 0U, 0U});
-    SyncFunc<HardEvent::MTE2_S>();
-    slot_ = decision_(0);
-    SyncFunc<HardEvent::S_MTE2>();
-    if (slot_ >= 0) {
-        DataCopyPad(batchInfoTensor_, batchInfoGMTensor_,
-            {1U, sizeof(int64_t) * BATCH_INFO_VAL_NUM, 0U, 0U, 0U}, {false, 0U, 0U, 0U});
-        SyncFunc<HardEvent::MTE2_S>();
-        SyncFunc<HardEvent::S_MTE2>();
-    }
-    SyncAll<true>();
-    return slot_ >= 0 ? batchInfoTensor_(ATTN_RANK_ID_INDEX) : 0;
-}
-
-template <TemplateMC2TypeClass>
-__aicore__ inline void AfdAsyncDispatchRecv<TemplateMC2TypeFunc>::FinishGraph(int64_t slot)
-{
-    if (aivId_ == 0) {
-        // Preserve the first error across all queued replays, including Init
-        // failures before WaitGraph. Host STOP writes only the other word.
-        DataCopyPad(decision_, stopGM_[AfdCam::ERROR_WORD],
-            {1U, sizeof(int64_t), 0U, 0U, 0U}, {false, 0U, 0U, 0U});
-        SyncFunc<HardEvent::MTE2_S>();
-        const int64_t firstError = decision_(0);
-        SyncFunc<HardEvent::S_MTE2>();
-        if (firstError < AfdCam::STOP) {
-            slot = firstError;
-        } else if (slot < AfdCam::STOP) {
-            decision_(0) = slot;
-            SyncFunc<HardEvent::S_MTE3>();
-            DataCopyPad(stopGM_[AfdCam::ERROR_WORD], decision_,
-                {1U, sizeof(int64_t), 0U, 0U, 0U});
-            SyncFunc<HardEvent::MTE3_S>();
-        }
-        const uint32_t words = INFO_NUM + tpSize_ + expertNumPerMoe_ * tpSize_;
-        for (uint32_t i = 0; i < words; ++i) { tpBatchInfoTensor_(i) = 0; }
-        for (uint32_t i = 0; i < expertNumPerMoe_; ++i) { epRecvCountOutTensor_(i) = 0; }
-        tpBatchInfoTensor_(LAYER_INDEX_INDEX) = slot;
-        decision_(0) = slot;
-        SyncFunc<HardEvent::S_MTE3>();
-        DataCopyPad(slotGM_, decision_, {1U, sizeof(int64_t), 0U, 0U, 0U});
-        DataCopyPad(batchInfoGMTensor_, tpBatchInfoTensor_, {1U, static_cast<uint32_t>(words * sizeof(int64_t)), 0U, 0U, 0U});
-        DataCopyPad(epRecvCountRoutedGMTensor_, epRecvCountOutTensor_,
-            {1U, static_cast<uint32_t>(expertNumPerMoe_ * sizeof(int64_t)), 0U, 0U, 0U});
-        SyncFunc<HardEvent::MTE3_S>();
-    }
-    SyncAll<true>();
 }
 
 template <TemplateMC2TypeClass>

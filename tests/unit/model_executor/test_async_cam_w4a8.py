@@ -93,9 +93,7 @@ def test_device_layer_selection_capacity_and_scaling(
         for method in ("cpu", "item", "tolist", "__int__", "__bool__"):
             hot.setattr(torch.Tensor, method, reject_host_read)
         if via_graph:
-            output = executor.execute_graph(
-                hidden, scales, counts, torch.tensor([1]), []
-            )
+            output = executor(hidden, scales, counts, metadata, retained_tensors=[])
         else:
             output = executor(hidden, scales, counts, metadata)
     torch.testing.assert_close(metadata, original)

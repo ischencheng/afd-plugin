@@ -3,7 +3,6 @@
 """The FFN graph E2E must prove real execution, not just HTTP success."""
 
 import copy
-import json
 from types import SimpleNamespace
 
 import pytest
@@ -114,27 +113,3 @@ def test_only_ffn_graph_mode_changes_between_profiles(tmp_path):
         env = ffn_graph.environment_for(args, profile, role)
         assert env["VLLM_USE_V2_MODEL_RUNNER"] == "1"
         assert env["AFD_ASYNC_CAM_LAYERED_GMM"] == ("1" if role == "ffn" else "0")
-
-
-@pytest.mark.parametrize("failure", [None, "nonzero", "forced", "missing-release"])
-def test_shutdown_audit_requires_exit_and_worker_completion(tmp_path, failure):
-    cleanup: dict = {"failures": [], "exit_codes": {"attention": 0, "ffn": 0}}
-    if failure == "nonzero":
-        cleanup["exit_codes"]["ffn"] = 1
-    (tmp_path / "cleanup.json").write_text(json.dumps(cleanup))
-    (tmp_path / "attention.log").write_text("")
-    (tmp_path / "ffn.log").write_text("force killing" if failure == "forced" else "")
-    (tmp_path / "workers").mkdir()
-    for rank in range(8):
-        record = {
-            "phase": "shutdown_complete",
-            "transport_live": failure == "missing-release" and rank == 0,
-            "shutdown": True,
-            "model_released": True,
-        }
-        (tmp_path / "workers" / f"rank-{rank}.jsonl").write_text(json.dumps(record))
-    if failure:
-        with pytest.raises(AssertionError):
-            ffn_graph.audit_shutdown(tmp_path)
-    else:
-        ffn_graph.audit_shutdown(tmp_path)

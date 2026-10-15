@@ -3,8 +3,9 @@
 """Synthetic-weight integration of the real Async runner and CAM connector.
 
 Run on three isolated 910C devices with torchrun --nproc-per-node=3.
-This covers native transport, layered compute, a service thread, drain, and
-cleanup. It deliberately does not claim checkpoint-loader or model E2E coverage.
+This covers native transport, layered compute, repeated replay, and finite
+completion. Production DR cancellation is not part of this fixture. It does not
+claim checkpoint-loader or model E2E coverage.
 """
 
 from __future__ import annotations
@@ -24,10 +25,7 @@ import torch
 import torch.distributed as dist
 import torch_npu
 
-from afd_plugin.compat.npu.ops import (
-    ensure_cam_async_ops_available,
-    ensure_cam_ffn_graph_available,
-)
+from afd_plugin.compat.npu.ops import ensure_cam_async_ops_available
 from afd_plugin.config import parse_afd_config
 from afd_plugin.connectors.metadata import AFDTransferContext, AFDTransferMetadata
 from afd_plugin.connectors.npu.async_cam import CAMAsyncAFDConnector
@@ -86,120 +84,21 @@ class SyntheticModel(torch.nn.Module):
         return self.layers, ""
 
 
-def check_failed_graph_epoch(connector, runner, thread, errors, *, rank, device):
-    """Prove native ERROR and retention, then tear down this failed test epoch.
-
-    No CR or normal drain is attempted for the bad dispatch. Test-only teardown
-    fences every submitted kernel before releasing the graph and groups. It is
-    not a successful production shutdown or a recovered service epoch.
-    """
-    report = {"rank": rank, "normal_shutdown": False}
-    if rank == 0:
-        hidden = torch.ones((1, HIDDEN), dtype=torch.bfloat16, device=device)
-        context = AFDTransferContext(AFDTransferMetadata(3, 0, [1]))
-        connector.send_attn_output(
-            hidden,
-            context,
-            topk_ids=torch.tensor([[0, 1]], dtype=torch.int32, device=device),
-            topk_weights=torch.full((1, 2), 0.5, device=device),
-        )
-        event = torch.npu.Event()
-        event.record()
-        deadline = time.monotonic() + 30
-        while not event.query():
-            if time.monotonic() >= deadline:
-                raise TimeoutError("invalid-layer DS did not finish")
-            time.sleep(0.01)
-        while True:
-            try:
-                connector.check_graph_failure()
-            except RuntimeError:
-                break
-            if time.monotonic() >= deadline:
-                raise TimeoutError("FFN failed to report its graph ERROR")
-            time.sleep(0.01)
-        try:
-            connector.close()
-        except RuntimeError:
-            pass
-        else:
-            raise AssertionError("failed Attention epoch must retain pending CR")
-        assert connector._pending_attention_payloads and connector.cam_pg is not None
-        report["pending_owner_context_retained"] = True
-    else:
-        thread.join(timeout=30)
-        assert not thread.is_alive() and errors
-        session = runner
-        assert session._graph_done.query(), "cannot tear down an in-flight error graph"
-        slot = int(session._graph_host_slot[0])
-        assert slot == -2
-        assert connector._graph_stop.cpu().tolist() == [0, -2]
-        replays = session._graph_replay_count
-        assert replays == runner.startup_replays + len(LAYERS)
-        for operation in (
-            runner.execute_connector_driven_step,
-            session._submit_graph,
-            runner.shutdown,
-            session._close_graph,
-        ):
-            try:
-                operation()
-            except RuntimeError:
-                pass
-            else:
-                raise AssertionError(
-                    "failed graph must not replay or release resources"
-                )
-        assert session._graph_replay_count == replays
-        assert (
-            session._graph_payload is not None
-            and session._graph_tensors
-            and runner.model is not None
-        )
-        report.update(slot=slot, retained_resources=True, replay_count=replays)
-    # Device completion is proven above on every rank. This is an explicit
-    # process-epoch test teardown, bypassing no pending device access.
-    dist.barrier()
-    if rank:
-        runner._graph.reset()
-    reports = [None] * 3
-    dist.all_gather_object(reports, report)
-    dist.destroy_process_group(connector.cam_pg)
-    dist.destroy_process_group()
-    faulthandler.cancel_dump_traceback_later()
-    if rank == 0:
-        print(
-            json.dumps(
-                {
-                    "result": "PASS",
-                    "failed_epoch_teardown_only": True,
-                    "reports": reports,
-                }
-            ),
-            flush=True,
-        )
-
-
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--per-group", action="store_true")
-    parser.add_argument("--idle-only", action="store_true")
     parser.add_argument("--full-graph", action="store_true")
     parser.add_argument("--attn-ranks", type=int, choices=(1, 2), default=1)
     parser.add_argument("--boundary", action="store_true")
     parser.add_argument("--save-outputs")
     parser.add_argument("--reference-outputs")
-    parser.add_argument("--invalid-layer", action="store_true")
     args = parser.parse_args()
-    if args.invalid_layer:
-        assert args.full_graph and args.attn_ranks == 1
-    elif args.full_graph and not args.idle_only and not args.reference_outputs:
-        parser.error("FULL business replay requires saved matching eager outputs")
+    if args.full_graph and not args.reference_outputs:
+        parser.error("FULL replay requires saved matching eager outputs")
     faulthandler.dump_traceback_later(60)
     os.environ["AFD_ASYNC_CAM_LAYERED_GMM"] = "1"
     os.environ["BATCH_SIZE_FACTOR"] = str(16 / 262144)
     os.environ["HCCL_BUFFSIZE"] = "64"
-    ensure_cam_ffn_graph_available()
     ensure_cam_async_ops_available()
     rank = int(os.environ["RANK"])
     local_rank = int(os.environ["LOCAL_RANK"])
@@ -280,7 +179,6 @@ def main():
                         state.dynamic_scales,
                         state.group_list,
                         state.token_nums_rankid_layeridx,
-                        state.layer_slot,
                         state.send_completion,
                         session._graph_output,
                         *session._graph_tensors,
@@ -298,9 +196,8 @@ def main():
 
             connector.recv_attn_output = forbid_python_transaction
             connector.send_ffn_output = forbid_python_transaction
-            runner._layered_executor.execute_graph = forbid_python_transaction
             # Test-only per-replay observations, fenced once at the batch end.
-            # Production batching has only the final one-element slot D2H.
+            # Production batching performs no host metadata copy.
             session = runner
             state = session._graph_payload.context.states
             headers = torch.empty(
@@ -328,7 +225,7 @@ def main():
             session._graph = SimpleNamespace(replay=observed_replay, reset=graph.reset)
     else:
         connector.init_afd_connector()
-    if not args.full_graph and not args.idle_only:
+    if not args.full_graph:
         # Cold MC2 needs all A/F peers to participate. This finite eager fixture
         # warms the original operators concurrently before ordered DP cases.
         with torch.inference_mode():
@@ -352,8 +249,8 @@ def main():
     if not is_ffn:
         runner = thread = None
 
-    cases = [] if args.idle_only else [(2, False, 7), (5, True, 7), (2, False, 7)]
-    if args.boundary and not args.idle_only:
+    cases = [(2, False, 7), (5, True, 7), (2, False, 7)]
+    if args.boundary:
         cases.extend(((5, False, 16), (2, True, 16)))
     expected: list[tuple[int, int, int | None]] = []
     for layer_id, sparse, tokens in cases:
@@ -398,12 +295,19 @@ def main():
                     for _ in expected:
                         runner._ffn_forward_connector_driven(single=True)
                 return
-            while True:
+            connector.graph_service_ready()
+            for start in range(0, len(expected), len(LAYERS)):
                 batch_index = 0
-                keep_running = runner.execute_connector_driven_step()
+                # Test-only finite work count, including the final short batch.
+                # The production loop has no EOS or cross-role stop protocol.
+                count = min(len(LAYERS), len(expected) - start)
+                runner._submit_graph(count)
+                runner._complete_graph()
                 session = runner
                 assert capture_addresses() == captured_addresses
-                for header, group in zip(headers.tolist(), counts, strict=True):
+                for header, group in zip(
+                    headers[:count].tolist(), counts[:count], strict=True
+                ):
                     if header[2] >= 0:
                         report["work"].append(
                             {
@@ -412,9 +316,7 @@ def main():
                                 "rows": int(group.sum()),
                             }
                         )
-                if not keep_running:
-                    break
-                if args.boundary:
+                if args.boundary and start + count < len(expected):
                     # Poison between completed replays on the graph stream.
                     # DR must overwrite valid rows and ignore unused capacity.
                     with (
@@ -424,22 +326,17 @@ def main():
                         session._graph_payload.hidden_states.fill_(113)
                         session._graph_payload.context.states.dynamic_scales.fill_(3)
                         session._graph_output.fill_(123)
+            runner._graph_receiver_exited = True
         except Exception as exc:
             errors.append(exc)
             print(json.dumps({"rank": rank, "service_error": repr(exc)}), flush=True)
-            # Test-only error propagation avoids submitting CR for the deliberate
-            # invalid layer. It is not production failure recovery or shutdown.
+            # Report fixture failure to peers; never substitute eager execution.
             connector.fail_graph_startup(exc)
 
     if is_ffn:
         thread = threading.Thread(target=serve, name="afd-runtime-test", daemon=True)
         thread.start()
     dist.barrier()
-    if args.invalid_layer:
-        check_failed_graph_epoch(
-            connector, runner, thread, errors, rank=rank, device=device
-        )
-        return
     outputs: list[torch.Tensor] = []
     references = None
     if not is_ffn and args.reference_outputs:
@@ -498,22 +395,11 @@ def main():
         if references is not None:
             assert len(references) == len(outputs)
             report["eager_exact_match"] = True
-        # F is now (or shortly will be) blocked in a fresh receive. This waits
-        # on native completion and Store acknowledgements from the real path.
-        time.sleep(0.5)
-        connector.quiesce_attention()
-        connector.quiesce_attention()
         assert not connector._pending_attention_payloads
     else:
-        # This fixture's main thread acts as the worker control loop while
-        # the service thread waits for completion of the idle receive.
         assert thread is not None
-        deadline = time.monotonic() + 30
-        while thread.is_alive() and time.monotonic() < deadline:
-            if args.full_graph:
-                connector.poll_graph_stop()
-            thread.join(timeout=0.02)
-        assert not thread.is_alive(), "service did not stop within 30 seconds"
+        thread.join(timeout=30)
+        assert not thread.is_alive(), "finite work did not complete within 30 seconds"
         if errors:
             raise errors[0]
         assert len(report["work"]) == len(expected)
@@ -524,18 +410,13 @@ def main():
             if rows is not None:
                 assert observed["rows"] == rows, "zero work or chunk mismatch"
         if args.full_graph:
-            report["terminal_slot"] = int(runner._graph_host_slot[0])
-            assert report["terminal_slot"] == -1 and connector._graph_stopped
             report["graph"] = {
                 "capture_count": runner._graph_capture_count,
-                "startup_replays": runner.startup_replays,
                 "replay_count": runner._graph_replay_count,
                 "python_transaction_disabled": True,
                 "stable_exposed_addresses": len(captured_addresses),
             }
-            business_replays = runner._graph_replay_count - runner.startup_replays
-            assert business_replays % len(LAYERS) == 0
-            assert 1 <= business_replays - len(report["work"]) <= len(LAYERS)
+            assert runner._graph_replay_count == len(expected)
     # Retain the TCPStore owner until finite eager peers have consumed all work.
     dist.barrier()
     if is_ffn:

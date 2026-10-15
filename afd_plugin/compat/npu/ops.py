@@ -120,21 +120,6 @@ def ensure_cam_async_ops_available() -> None:
         ) from exc
 
 
-def ensure_cam_ffn_graph_available() -> None:
-    """Require graph DR only when requesting FFN FULL."""
-    ensure_cam_async_ops_available()
-    import torch
-
-    try:
-        _ = torch.ops.afd_ascend.afd_async_dispatch_recv_controlled
-        check_graph = torch.ops.afd_ascend.check_cam_ffn_graph_available
-    except AttributeError as exc:
-        raise RuntimeError(
-            "Rebuild AFD extension and CANN package for FFN graph DR"
-        ) from exc
-    check_graph()
-
-
 __all__ = [
     "AFD_ASCEND_OPS_NAMESPACE",
     "AFD_ASCEND_VENDOR_NAME",
@@ -146,7 +131,6 @@ __all__ = [
     "CAM_OP_NAMESPACE",
     "ensure_afd_ascend_ops_loaded",
     "ensure_cam_async_ops_available",
-    "ensure_cam_ffn_graph_available",
     "ensure_cam_p2p_ops_available",
     "get_afd_cann_vendor_path",
     "get_afd_cust_opapi_path",

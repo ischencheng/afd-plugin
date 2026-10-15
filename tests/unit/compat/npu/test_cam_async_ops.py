@@ -64,7 +64,6 @@ def _dispatch_recv(torch: ModuleType, *, dynamic_quant: int = 0, moe_rank_id: in
         "afd_async_dispatch_recv",
         "afd_async_combine_send",
         "afd_async_combine_recv",
-        "afd_async_dispatch_recv_controlled",
     ),
 )
 def test_cam_dispatcher_registers_inference_and_meta_kernels(cam_runtime, name: str):
@@ -74,57 +73,6 @@ def test_cam_dispatcher_registers_inference_and_meta_kernels(cam_runtime, name: 
         )
     schema = getattr(cam_runtime.ops.afd_ascend, name).default._schema
     assert all("shared" not in argument.name for argument in schema.arguments)
-
-
-def _controlled_receive(torch, **changes):
-    arguments = dict(
-        x=torch.empty(1, device="meta", dtype=torch.bfloat16),
-        comm_args=torch.empty(1, device="meta", dtype=torch.float16),
-        comm_id=0,
-        max_seq_len=64,
-        hidden_size=64,
-        top_k=2,
-        moe_rank_num=2,
-        attn_rank_num=2,
-        route_expert_num_per_moe=3,
-        moe_rank_id=2,
-        world_size=4,
-        tp_size=2,
-        dynamic_quant=1,
-        group_name="meta_only",
-        stop=torch.empty(2, device="meta", dtype=torch.int64),
-        valid_layers=torch.empty(2, device="meta", dtype=torch.int64),
-    )
-    arguments.update(changes)
-    return torch.ops.afd_ascend.afd_async_dispatch_recv_controlled(**arguments)
-
-
-def test_graph_slot_is_an_output_without_changing_wire_geometry(cam_runtime):
-    received = _controlled_receive(cam_runtime)
-    assert len(received) == 5
-    assert received[2].shape == (13,)
-    assert received[3].shape == (3,)
-    assert received[4].shape == (1,) and received[4].dtype == cam_runtime.int64
-    schema = (
-        cam_runtime.ops.afd_ascend.afd_async_dispatch_recv_controlled.default._schema
-    )
-    assert [arg.name for arg in schema.arguments][-2:] == ["stop", "valid_layers"]
-    assert schema.arguments[-2].alias_info.is_write
-    assert all(arg.alias_info is None for arg in schema.arguments if arg.name != "stop")
-
-
-@pytest.mark.parametrize("name,size", [("stop", 1), ("stop", 3), ("valid_layers", 0)])
-def test_controlled_receive_rejects_malformed_buffers(cam_runtime, name, size):
-    torch = cam_runtime
-    with pytest.raises(RuntimeError, match=name):
-        _controlled_receive(
-            torch, **{name: torch.empty(size, device="meta", dtype=torch.int64)}
-        )
-
-
-def test_controlled_receive_rejects_unrepresentable_token_offsets(cam_runtime):
-    with pytest.raises(RuntimeError, match="uint16"):
-        _controlled_receive(cam_runtime, max_seq_len=262144)
 
 
 @pytest.mark.parametrize("dtype_name", ["float16", "bfloat16"])

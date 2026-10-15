@@ -6,7 +6,6 @@ from __future__ import annotations
 
 import logging
 import threading
-import time
 from typing import TYPE_CHECKING, Any
 
 import torch
@@ -22,11 +21,6 @@ from afd_plugin.compat.npu import (
     fail_if_unsupported_npu_afd_features,
     fix_all2all_backend_for_afd,
     npu_afd_num_ubatches,
-)
-from afd_plugin.connectors.npu.async_cam import (
-    POLL_SECONDS,
-    SHUTDOWN_TIMEOUT_SECONDS,
-    CAMAsyncAFDConnector,
 )
 from afd_plugin.model_executor.models.model_utils import get_afd_model_config
 from afd_plugin.v1.worker.npu.async_ffn_model_runner import (
@@ -129,7 +123,11 @@ class AFDNPUFFNWorker(NPUWorker):
                 self._run_ffn_server_loop()
             except Exception as exc:
                 shutdown_event = self._ffn_shutdown_event
-                if shutdown_event is not None and shutdown_event.is_set():
+                if (
+                    not self._uses_async_full_graph()
+                    and shutdown_event is not None
+                    and shutdown_event.is_set()
+                ):
                     logger.debug(
                         "AFD NPU FFN receive loop stopped during shutdown",
                         exc_info=True,
@@ -137,6 +135,9 @@ class AFDNPUFFNWorker(NPUWorker):
                     return
                 self._ffn_loop_error = exc
                 logger.exception("AFD NPU FFN worker loop failed")
+            else:
+                if self._uses_async_full_graph():
+                    self.model_runner._graph_receiver_exited = True
 
         self._ffn_thread = threading.Thread(
             target=ffn_worker_loop,
@@ -199,42 +200,33 @@ class AFDNPUFFNWorker(NPUWorker):
             )
             torch.npu.synchronize()
 
+    def _uses_async_full_graph(self) -> bool:
+        return (
+            isinstance(self.model_runner, AsyncNPUFFNModelRunner)
+            and self.model_runner.effective_mode == "full"
+        )
+
     def raise_ffn_loop_error_if_any(self) -> None:
         error = self._ffn_loop_error
         if error is not None:
-            self._ffn_loop_error = None
+            if not self._uses_async_full_graph():
+                self._ffn_loop_error = None
             raise RuntimeError("AFD NPU FFN worker loop failed") from error
-        if (
-            isinstance(self.model_runner, AsyncNPUFFNModelRunner)
-            and self.model_runner.effective_mode == "full"
-            and isinstance(self.model_runner.connector, CAMAsyncAFDConnector)
-            and self.model_runner.connector.graph_receiving
-        ):
-            self.model_runner.connector.poll_graph_stop()
 
     def stop_ffn_server_loop(self) -> None:
         event = self._ffn_shutdown_event
-        if (
-            isinstance(self.model_runner, AsyncNPUFFNModelRunner)
-            and self.model_runner.effective_mode == "full"
-        ):
-            # EngineCore's regular health polling stops when shutdown begins.
-            # This control RPC takes over drain/STOP until the service exits.
-            thread = self._ffn_thread
-            if thread is not None:
-                deadline = time.monotonic() + SHUTDOWN_TIMEOUT_SECONDS
-                while thread.is_alive():
-                    self.raise_ffn_loop_error_if_any()
-                    remaining = deadline - time.monotonic()
-                    if remaining <= 0:
-                        raise RuntimeError(
-                            "Async graph did not stop; retain live resources"
-                        )
-                    thread.join(timeout=min(POLL_SECONDS, remaining))
-            self.raise_ffn_loop_error_if_any()
-            self.model_runner.shutdown()
+        if self._uses_async_full_graph():
             if event is not None:
                 event.set()
+            thread = self._ffn_thread
+            if thread is not None:
+                thread.join(timeout=FFN_SHUTDOWN_TIMEOUT_SECONDS)
+                if thread.is_alive():
+                    raise RuntimeError(
+                        "Async graph receive is pending; retain resources"
+                    )
+            self.raise_ffn_loop_error_if_any()
+            self.model_runner.shutdown()
             self._ffn_thread = None
             self._ffn_shutdown_event = None
             return

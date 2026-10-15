@@ -21,7 +21,6 @@ namespace MoeDistributeCombineSendImpl {
 constexpr uint64_t CAM_MAX_RANK_SIZE = 384;  // max NPUs supported by the Cam comm library
 constexpr uint32_t UB_ALIGN = 32;            // UB aligned to 32 bytes
 constexpr uint32_t MAX_AIV_NUM = 48;         // max AIV core count
-constexpr uint32_t LAYER_INDEX_INDEX = 2;
 constexpr uint32_t INFO_NUM = 5;  // number of valid batch-info fields; also start/end expert per chunk
 
 template <AscendC::HardEvent event>
@@ -178,12 +177,6 @@ __aicore__ inline void AfdAsyncCombineSend<TemplateMC2TypeFunc>::Process()
         {false, 0U, 0U, 0U});
     SyncFunc<HardEvent::MTE2_S>();
     SyncFunc<HardEvent::S_MTE2>();
-
-    // Graph DR publishes a local terminal header; no return address or
-    // normal completion may be produced for this replay.
-    if (tpBatchInfoTensor_(LAYER_INDEX_INDEX) < 0) {
-        return;
-    }
 
     CombineSend();
 }

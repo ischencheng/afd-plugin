@@ -32,7 +32,7 @@ unsplit locally. Both token thresholds must be at least two.
 Attention DP replicas make that decision independently; FFN is connector-driven.
 
 FFN also supports the experimental complete-transaction FULL mode described in
-[Async FFN runtime](ASYNC_FFN_RUNTIME.md#full-selection-and-startup).
+[Async FFN runtime](ASYNC_FFN_RUNTIME.md#selection-and-startup).
 FULL requires MRV2 Attention with DBO disabled on every rank. Attention graph
 execution remains unsupported.
 
@@ -297,7 +297,7 @@ actual vendor library path. Missing source operators fail startup.
 ## Current limitations
 
 - Attention is eager. FFN FULL targets homogeneous W4A8 layers on A3/910C;
-  see [supported configuration](ASYNC_FFN_RUNTIME.md#full-selection-and-startup)
+  see [supported configuration](ASYNC_FFN_RUNTIME.md#selection-and-startup)
   and [validation commands](ASYNC_FFN_RUNTIME.md#validation).
   Broader models and topologies require separate validation.
 - Regular prefill and autoregressive decode steps are supported; context
@@ -346,10 +346,9 @@ FFN does not apply it again.
 The graph change preserves the existing layered arithmetic: `swiglu_limit` is
 recorded but is not applied by layered W13. Ordinary eager may apply it, so
 FULL must be compared with corresponding layered eager, not treated as a fix
-for their pre-existing difference. FULL requires the matching graph DR native
-package and extension. It uses original CS with a local terminal guard; see
-[the native interface](ASYNC_FFN_RUNTIME.md#native-interface-and-normal-stopping)
-for the STOP/error contract.
+for their pre-existing difference. FULL reuses the existing native DR and CS operators. See
+[resource lifetime](ASYNC_FFN_RUNTIME.md#resource-lifetime) for completion and
+process-cleanup requirements.
 Missing `w13_scale_bias` or `w2_scale_bias`, dynamic EPLB, non-SiLU
 activation, or incompatible parameters fail before receiving work. Non-W4A8,
 mixed-quantization, and heterogeneous layers stay on the legacy path with a
@@ -377,6 +376,8 @@ Run the compiled Meta and NPU numerical tests described in the
 target-device validation of completion, checkpoint accuracy and performance.
 
 To revert, set `AFD_ASYNC_CAM_LAYERED_GMM=0` and restart the FFN processes.
+When switching from FULL to legacy eager, also pass `--enforce-eager` explicitly
+before restarting FFN.
 For performance runs, disable `AFD_CAM_OP_IO_LOG` and
 `AFD_FORCE_BALANCED_TOPK_IDS`, retain the actual-path startup log, and measure
 the existing group synchronization separately.

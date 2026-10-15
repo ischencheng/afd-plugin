@@ -43,11 +43,6 @@ grouped_matmul_swiglu_quant_v2_layered(GM_ADDR x, GM_ADDR xScale, GM_ADDR groupL
 
     // layered: consume layer_index at Init stage (one 8B GM read per core).
     int64_t curLayer = LayeredReadLayerIndex(layerIndex);
-    // Controlled DR publishes -1 on STOP/ERROR. All AIC/AIV cores take this
-    // branch before entering a mixed-core pipeline or touching a weight list.
-    if (curLayer < 0) {
-        return;
-    }
 
 #if defined(GMM_SWIGLU_QUANT_V2_A8W4_MSD)
     if (TILING_KEY_IS(2)) {

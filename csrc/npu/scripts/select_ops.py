@@ -72,14 +72,6 @@ def resolve(registry, soc_list, shmem, user_ops):
     """Return the final ordered list of operator directory names to compile."""
     # 1. Determine the candidate set: full SOC list or explicit selection.
     candidates = list(soc_list) if user_ops is None else list(user_ops)
-    # Controlled CAM operators share the base operator's host/kernel helpers.
-    # Include declared dependencies even for a selective operator build.
-    for op in candidates:
-        for dependency in get_meta(registry, op).get("dependencies", []):
-            if dependency not in soc_list:
-                die(f"operator '{op}' has unavailable dependency '{dependency}'")
-            if dependency not in candidates:
-                candidates.append(dependency)
 
     # 2. SHMEM filter: drop requires_shmem operators when SHMEM is not installed.
     if not shmem:

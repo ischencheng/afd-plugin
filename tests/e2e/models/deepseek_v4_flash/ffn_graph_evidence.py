@@ -32,12 +32,11 @@ def snapshot(runner) -> dict:
         result.update(
             mode=runner.effective_mode,
             requested=runner.requested_mode,
-            startup_replays=runner.startup_replays,
             capture_count=runner._graph_capture_count
             if runner._graph is not None
             else 0,
             replay_count=runner._graph_replay_count if runner._graph is not None else 0,
-            stopped=connector._graph_stopped,
+            receiver_exited=runner._graph_receiver_exited,
             step_pending=runner._graph_pending if runner._graph is not None else False,
             shutdown=runner._is_shutdown,
             model_released=runner.model is None,
@@ -98,8 +97,8 @@ def install_observers() -> None:
         }
 
     @wraps(complete)
-    def completed(self, timeout=None):
-        result = complete(self, timeout)
+    def completed(self):
+        result = complete(self)
         if result:
             observe(self.connector, self._graph_payload.context)
         return result
@@ -107,7 +106,7 @@ def install_observers() -> None:
     @wraps(send_eager)
     def sent(self, output, context, **kwargs):
         result = send_eager(self, output, context, **kwargs)
-        if not self.graph_receiving:
+        if self.ffn_graph_mode == "eager":
             # Functional coverage only. This fixture adds an eager event fence
             # for observations and must not be used for performance reporting.
             torch.npu.current_stream().synchronize()

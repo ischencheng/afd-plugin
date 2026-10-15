@@ -7,7 +7,7 @@ from __future__ import annotations
 import sys
 import threading
 from collections import deque
-from contextlib import contextmanager, nullcontext
+from contextlib import contextmanager
 from types import SimpleNamespace
 
 import pytest
@@ -130,7 +130,7 @@ def test_eager_uses_main_layer_loop_and_original_return_headers(harness):
     ]
     assert returned[0] is first.context.states.token_nums_rankid_layeridx
     assert returned[1] is zero.context.states.token_nums_rankid_layeridx
-    assert not h.connector.graph_receiving and h.connector._graph_stop is None
+    assert h.runner._graph is None
 
 
 def test_layered_eager_uses_raw_device_metadata(harness):
@@ -211,167 +211,56 @@ def test_direct_loader_uses_role_model_config_and_keeps_memory_accounting(
         h.runner.load_model()
 
 
-def test_graph_stop_fences_dma_before_final_store_access(harness):
-    c, calls = harness.connector, []
-    c._graph_stop_requested = True
-    c._stop_done = SimpleNamespace(synchronize=lambda: calls.append("dma-fence"))
-    c._graph_ffn_stopped = lambda: calls.append("stopped")
-    assert not c.finish_graph(-1)
-    assert calls == ["dma-fence", "stopped"] and c._graph_stopped
-    c._graph_store = None  # A may now destroy Store.
-    c.poll_graph_stop()
-    with pytest.raises(RuntimeError, match="slot=-2"):
-        c.finish_graph(-2)
-
-
-def test_graph_stop_waits_for_every_attention_rank(harness, monkeypatch):
-    c, calls = harness.connector, []
-    drained = False
-    c._graph_store = object()
-    c._all_attention_drained = lambda: drained
-    c._graph_stop = torch.tensor([0, -2])
-    c._stop_host = torch.tensor([1])
-    c._stop_stream = object()
-    c._stop_done = SimpleNamespace(record=lambda stream: calls.append("record"))
-    monkeypatch.setattr(torch.npu, "stream", lambda stream: nullcontext())
-    c.poll_graph_stop()
-    assert not calls
-    drained = True
-    c.poll_graph_stop()
-    c.poll_graph_stop()
-    assert calls == ["record"]
-    assert c._graph_stop.tolist() == [1, -2], "STOP must preserve the first error"
-
-
-def test_terminal_ack_waits_for_stop_publication(harness, monkeypatch):
-    c, calls = harness.connector, []
-    recording, allow_record = threading.Event(), threading.Event()
-    finishing, finished = threading.Event(), threading.Event()
-    errors = []
-
-    def record(stream):
-        recording.set()
-        assert allow_record.wait(5)
-        calls.append("record")
-
-    def finish():
-        finishing.set()
-        try:
-            assert not c.finish_graph(-1)
-        except Exception as exc:
-            errors.append(exc)
-        finally:
-            finished.set()
-
-    c._graph_store = object()
-    c._all_attention_drained = lambda: True
-    c._graph_ffn_stopped = lambda: calls.append("ack")
-    c._graph_stop = torch.zeros(2, dtype=torch.int64)
-    c._stop_host = torch.ones(1, dtype=torch.int64)
-    c._stop_stream = object()
-    c._stop_done = SimpleNamespace(
-        record=record, synchronize=lambda: calls.append("dma-fence")
-    )
-    monkeypatch.setattr(torch.npu, "stream", lambda stream: nullcontext())
-    control = threading.Thread(target=c.poll_graph_stop)
-    service = threading.Thread(target=finish)
-    control.start()
-    try:
-        assert recording.wait(5)
-        service.start()
-        assert finishing.wait(5)
-        assert not finished.wait(0.05)
-    finally:
-        allow_record.set()
-        control.join(5)
-        if service.ident is not None:
-            service.join(5)
-    assert not errors and finished.is_set()
-    assert calls == ["record", "dma-fence", "ack"]
-
-
-def test_attention_graph_shutdown_fences_once_and_never_steals_cr(harness, monkeypatch):
-    c, calls = harness.connector, []
-    c.world_rank = 0
-    c._graph_store = object()
-    c.ffn_graph_mode = "full"
-
-    def finish():
-        calls.append("drained")
-        c._graph_attention_finished = True
-
-    c._finish_attention_graph_shutdown = finish
-    monkeypatch.setattr(torch.npu, "synchronize", lambda: calls.append("device-fence"))
-    c._pending_attention_payloads[0] = [object()]
-    with pytest.raises(RuntimeError, match="consume pending CR"):
-        c.quiesce_attention()
-    assert not calls and c._pending_attention_payloads
-    c._pending_attention_payloads.clear()
-    c.quiesce_attention()
-    c.quiesce_attention()
-    assert calls == ["device-fence", "drained"]
-
-
-def test_eager_shutdown_does_not_use_graph_store_or_device_fence(harness, monkeypatch):
-    c = harness.connector
-    c.world_rank = 0
-    c._graph_store = object()
-    c.ffn_graph_mode = "eager"
-
-    def unexpected():
-        pytest.fail("graph drain called for ordinary eager")
-
-    monkeypatch.setattr(torch.npu, "synchronize", unexpected)
-    c.quiesce_attention()
-
-
-@pytest.mark.parametrize("alive", [True, False])
-def test_graph_stop_rpc_never_releases_live_thread(harness, monkeypatch, alive):
+@pytest.mark.parametrize("state", ["live", "failed", "drained"])
+def test_full_stop_only_releases_normal_completed_receiver(harness, monkeypatch, state):
     calls = []
-    runner = harness.runner
-    runner.effective_mode = "full"
-    runner.shutdown = lambda: calls.append("release")
-    worker = AFDNPUFFNWorker.__new__(AFDNPUFFNWorker)
-    worker.model_runner = runner
-    worker._ffn_shutdown_event = SimpleNamespace(set=lambda: calls.append("event"))
-    worker._ffn_thread = SimpleNamespace(
-        join=lambda **kwargs: calls.append("join"), is_alive=lambda: alive
-    )
-    worker._ffn_loop_error = None
-    monkeypatch.setattr(
-        "afd_plugin.v1.worker.npu.ffn_worker.SHUTDOWN_TIMEOUT_SECONDS", 0
-    )
-    runner.connector._graph_store = (
-        None  # Store can already be gone before RPC resumes.
-    )
-    if alive:
-        with pytest.raises(RuntimeError, match="retain live resources"):
-            worker.stop_ffn_server_loop()
-        assert calls == []
-    else:
-        worker.stop_ffn_server_loop()
-        assert calls == ["release", "event"]
-
-
-def test_graph_stop_rpc_takes_over_control_polling(harness):
-    calls, live = [], True
     worker = AFDNPUFFNWorker.__new__(AFDNPUFFNWorker)
     worker.model_runner = harness.runner
     harness.runner.effective_mode = "full"
-    harness.connector.graph_receiving = True
-    harness.connector.poll_graph_stop = lambda: calls.append("poll-stop")
     harness.runner.shutdown = lambda: calls.append("release")
-    worker._ffn_loop_error = None
     worker._ffn_shutdown_event = threading.Event()
+    event = worker._ffn_shutdown_event
+    worker._ffn_loop_error = (
+        RuntimeError("receiver failed") if state == "failed" else None
+    )
 
     def join(timeout):
-        nonlocal live
-        assert calls == ["poll-stop"] and timeout > 0
+        assert event.is_set(), "stop must prevent subsequent submissions before joining"
         calls.append("join")
-        live = False
 
-    worker._ffn_thread = SimpleNamespace(join=join, is_alive=lambda: live)
-    worker.stop_ffn_server_loop()
-    assert calls == ["poll-stop", "join", "poll-stop", "release"]
-    worker.stop_ffn_server_loop()
-    assert worker._ffn_thread is None
+    worker._ffn_thread = SimpleNamespace(join=join, is_alive=lambda: state == "live")
+    if state == "drained":
+        worker.stop_ffn_server_loop()
+        assert calls == ["join", "release"] and worker._ffn_thread is None
+    else:
+        with pytest.raises(RuntimeError):
+            worker.stop_ffn_server_loop()
+        assert calls == ["join"] and worker._ffn_thread is not None
+        if state == "failed":
+            for _ in range(2):
+                with pytest.raises(RuntimeError, match="worker loop failed"):
+                    worker.raise_ffn_loop_error_if_any()
+            with pytest.raises(RuntimeError):
+                worker.start_ffn_server_loop()
+
+
+@pytest.mark.parametrize("fail", [False, True])
+def test_full_receiver_exit_requires_success_even_during_shutdown(harness, fail):
+    worker = AFDNPUFFNWorker.__new__(AFDNPUFFNWorker)
+    worker.model_runner = harness.runner
+    harness.runner.effective_mode = "full"
+    worker._ffn_thread = None
+    worker._ffn_loop_error = None
+    worker._bind_cpus_once = lambda: None
+
+    def serve():
+        worker._ffn_shutdown_event.set()
+        if fail:
+            raise RuntimeError("partial device completion")
+
+    worker._run_ffn_server_loop = serve
+    worker.start_ffn_server_loop()
+    worker._ffn_thread.join(3)
+    assert not worker._ffn_thread.is_alive()
+    assert harness.runner._graph_receiver_exited is not fail
+    assert (worker._ffn_loop_error is not None) is fail
