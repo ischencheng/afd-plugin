@@ -37,8 +37,9 @@ F HTTP API initialization is not a readiness requirement.
 ## Capture boundary and ownership
 
 The runner owns capture/replay, weights, stable buffers, a private graph pool
-and one execution stream. The connector owns CAM communication and startup
-negotiation. A captured transaction receives activations, scales, expert counts
+and one execution stream. The connector owns CAM communication. The host-only `AsyncCAMGraphStartup`
+coordinator owns Store negotiation, stage waits and failure propagation; it owns
+no device resources or threads. A captured transaction receives activations, scales, expert counts
 and the original return metadata from DR. Device-side layer selection uses
 `batch_info[2]`, through the existing mapping or a one-element clone. The same
 metadata goes to CS; host code does not select the layer or copy per-item inputs.
