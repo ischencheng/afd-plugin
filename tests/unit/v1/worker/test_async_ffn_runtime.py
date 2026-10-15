@@ -260,6 +260,7 @@ def test_full_receiver_exit_requires_success_even_during_shutdown(harness, fail)
 
     worker._run_ffn_server_loop = serve
     worker.start_ffn_server_loop()
+    assert isinstance(worker._ffn_thread, threading.Thread)
     worker._ffn_thread.join(3)
     assert not worker._ffn_thread.is_alive()
     assert harness.runner._graph_receiver_exited is not fail
