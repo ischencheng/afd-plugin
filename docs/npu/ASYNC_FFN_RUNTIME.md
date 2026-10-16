@@ -11,7 +11,9 @@ The target is the pinned vLLM 0.30 / vLLM-Ascend stack on A3/910C, with
 homogeneous DeepSeek-V4 W4A8 layers, dynamicQuant=1, static expert placement,
 F TP=1 and Attention-side gating. Both roles select
 `VLLM_USE_V2_MODEL_RUNNER=1`. Attention keeps `--enforce-eager`.
-Native DBO and its `async_moe_ubatching` alias must be disabled on every rank.
+Attention may enable native DBO or its `async_moe_ubatching` alias under the
+existing two-microbatch constraints. Enable native DBO only on Attention; FFN
+consumes CAM work items without joining Attention's DBO thread schedule.
 
 On F, set `AFD_ASYNC_CAM_LAYERED_GMM=1`, omit `--enforce-eager`, and pass
 `--compilation-config '{"cudagraph_mode":"FULL"}'`. To select eager explicitly,
@@ -92,6 +94,8 @@ Use the pinned stack and native artifacts built from the same baseline sources.
 The real-model fixture targets DeepSeek-V4 Flash per-channel W4A8 on A3/910C,
 4A/4F, A TP4, F TP1, receive capacity 128 and DBO disabled. Synthetic per-group
 coverage does not qualify loading real per-group checkpoints.
+The Attention DBO + FFN FULL combination has host configuration coverage only;
+the existing device results do not validate this combination.
 
 - Host contracts: `tests/unit/connectors/test_async_cam_startup.py`,
   `tests/unit/v1/worker/test_async_ffn_graph.py`, and

@@ -19,7 +19,7 @@ The supported deployment requires ``async=true``, Ascend CAM
 operator packages, and matching topology/configuration on every rank. Regular
 prefill and autoregressive decode steps use the same connector. Attention
 microbatching uses the native DBO runtime with Ascend adaptations. FFN FULL
-requires MRV2 and DBO-off on every rank. Legacy Async microbatching flags are
+requires MRV2 and accepts Attention-side DBO. Legacy Async microbatching flags are
 configuration aliases, and no independent Async split or model schedule is
 maintained. See ``docs/npu/CAM_ASYNC_CONNECTOR_USER_GUIDE.md`` for configuration, rank
 derivation, launch guidance, and the full limitations.
@@ -404,17 +404,8 @@ class CAMAsyncAFDConnector(AFDConnectorBase):
         self.graph_startup.initialize(store, signature)
         if self.graph_startup.mode == "full":
             try:
-                parallel = self.vllm_config.parallel_config
                 if not self.vllm_config.use_v2_model_runner:
                     raise ValueError("Async FFN FULL requires MRV2 on every rank")
-                if (
-                    parallel.enable_dbo
-                    or parallel.use_ubatching
-                    or self.extra_info.async_moe_ubatching
-                ):
-                    raise ValueError(
-                        "Async FFN FULL requires DBO disabled on every rank"
-                    )
                 validate_graph_capacity(
                     self.max_num_batched_tokens, self.tp_size, cam_receive_capacity()
                 )

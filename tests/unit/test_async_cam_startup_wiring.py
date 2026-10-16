@@ -11,6 +11,10 @@ from unittest.mock import MagicMock
 import pytest
 
 from afd_plugin.async_cam_startup import AsyncCAMGraphStartup
+from afd_plugin.compat.npu.feature_validation import (
+    _fail_if_unsupported_npu_afd_async_features,
+)
+from afd_plugin.config import parse_afd_config
 
 
 @pytest.fixture
@@ -65,8 +69,19 @@ def modules(monkeypatch):
     return group, connector, runtime
 
 
-@pytest.mark.parametrize("invalid", [False, True])
-def test_static_validation_precedes_hccl_creation(modules, monkeypatch, invalid):
+@pytest.mark.parametrize(
+    "invalid,dbo_flag",
+    [
+        (False, None),
+        (False, "enable_dbo"),
+        (False, "use_ubatching"),
+        (False, "async_moe_ubatching"),
+        (True, None),
+    ],
+)
+def test_static_validation_precedes_hccl_creation(
+    modules, monkeypatch, invalid, dbo_flag
+):
     group, connector_module, _ = modules
     order = []
     store = MagicMock()
@@ -107,6 +122,10 @@ def test_static_validation_precedes_hccl_creation(modules, monkeypatch, invalid)
         ),
         graph_startup=AsyncCAMGraphStartup(0, 1, 2),
     )
+    if dbo_flag == "async_moe_ubatching":
+        connector.extra_info.async_moe_ubatching = True
+    elif dbo_flag is not None:
+        setattr(connector.vllm_config.parallel_config, dbo_flag, True)
 
     def negotiate(store, signature):
         order.append("negotiate")
@@ -131,6 +150,43 @@ def test_static_validation_precedes_hccl_creation(modules, monkeypatch, invalid)
     else:
         connector.init_afd_connector()
         assert order == ["negotiate", "validated", "hccl", "attention-warmup"]
+
+
+@pytest.mark.parametrize(
+    "role,native_flag,num_ubatches,error",
+    [
+        ("ffn", "enable_dbo", 2, "requires the Attention role"),
+        ("ffn", "use_ubatching", 2, "requires the Attention role"),
+        ("attention", "enable_dbo", 3, "requires exactly two ubatches"),
+    ],
+)
+def test_graph_dbo_keeps_existing_role_and_count_validation(
+    modules, role, native_flag, num_ubatches, error
+):
+    _, connector_module, _ = modules
+    config = SimpleNamespace(
+        additional_config={
+            "afd": {
+                "role": role,
+                "connector": "CAMAsyncAFDConnector",
+                "async_dp": True,
+            }
+        },
+        model_config=SimpleNamespace(enforce_eager=role == "attention"),
+        compilation_config=SimpleNamespace(cudagraph_mode=SimpleNamespace(name="FULL")),
+        use_v2_model_runner=True,
+        parallel_config=SimpleNamespace(
+            enable_dbo=False,
+            use_ubatching=False,
+            num_ubatches=num_ubatches,
+            tensor_parallel_size=1,
+        ),
+    )
+    setattr(config.parallel_config, native_flag, True)
+    with pytest.raises(RuntimeError, match=error):
+        _fail_if_unsupported_npu_afd_async_features(
+            config, parse_afd_config(config), connector_module.AFDAsyncExtraInfo()
+        )
 
 
 def test_ffn_announces_service_only_on_receiver_execution(modules):
