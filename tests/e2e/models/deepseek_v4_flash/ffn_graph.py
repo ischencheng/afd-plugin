@@ -367,10 +367,21 @@ def main() -> None:
         if accepted != {"mode": "eager", "passed": True}:
             raise ValueError("Reference must be a completed layered eager run")
 
-    def interrupt_run(signum, _frame):
-        raise SystemExit(128 + signum)
+    received_signal: int | None = None
+    cleanup_in_progress = False
+    handled_signals = (signal.SIGTERM, signal.SIGINT)
+    previous_handlers = {sig: signal.getsignal(sig) for sig in handled_signals}
 
-    previous_handler = signal.signal(signal.SIGTERM, interrupt_run)
+    def interrupt_run(signum, _frame):
+        nonlocal received_signal
+        if received_signal is not None:
+            return
+        received_signal = signum
+        if not cleanup_in_progress:
+            raise SystemExit(128 + signum)
+
+    for sig in handled_signals:
+        signal.signal(sig, interrupt_run)
     processes = {}
     logs = []
     try:
@@ -435,35 +446,51 @@ def main() -> None:
             {"mode": args.mode, "passed": True},
         )
     finally:
-        # Original DR is not cancellable. The fixture may terminate the owned
-        # processes; this is cleanup, not a graceful-shutdown qualification.
-        failures = terminate_process_groups(
-            list(processes.values()),
-            termination_timeout_s=SHUTDOWN_TIMEOUT,
-            poll_interval_s=0.2,
-            reap_timeout_s=5,
-            process_name="AFD A/F",
-        )
-        forced = [item for item in failures if item.startswith("forced SIGKILL for ")]
-        failures = [item for item in failures if item not in forced]
-        signal.signal(signal.SIGTERM, previous_handler)
-        for log in logs:
-            log.close()
-        save(
-            args.output_dir / "cleanup.json",
-            {
-                "failures": failures,
-                "forced_cleanup": forced,
-                "graceful_shutdown_qualified": False,
-                "exit_codes": {
-                    role: process.poll() for role, process in processes.items()
+        cleanup_in_progress = True
+        cleanup_error: BaseException | None = None
+        try:
+            # Original DR is not cancellable. The fixture may terminate the owned
+            # processes; this is cleanup, not a graceful-shutdown qualification.
+            failures = terminate_process_groups(
+                list(processes.values()),
+                termination_timeout_s=SHUTDOWN_TIMEOUT,
+                poll_interval_s=0.2,
+                reap_timeout_s=5,
+                process_name="AFD A/F",
+            )
+            forced = [
+                item for item in failures if item.startswith("forced SIGKILL for ")
+            ]
+            failures = [item for item in failures if item not in forced]
+            for log in logs:
+                log.close()
+            save(
+                args.output_dir / "cleanup.json",
+                {
+                    "failures": failures,
+                    "forced_cleanup": forced,
+                    "graceful_shutdown_qualified": False,
+                    "exit_codes": {
+                        role: process.poll() for role, process in processes.items()
+                    },
                 },
-            },
-        )
-        if failures:
-            print("Cleanup failed: " + repr(failures), file=sys.stderr)
-            if sys.exc_info()[0] is None:
-                raise RuntimeError("Service cleanup failed")
+            )
+            if failures:
+                print("Cleanup failed: " + repr(failures), file=sys.stderr)
+                if sys.exc_info()[0] is None:
+                    raise RuntimeError("Service cleanup failed")
+        except BaseException as exc:
+            cleanup_error = exc
+        finally:
+            for sig, previous_handler in previous_handlers.items():
+                signal.signal(
+                    sig,
+                    signal.SIG_DFL if previous_handler is None else previous_handler,
+                )
+        if received_signal is not None:
+            raise SystemExit(128 + received_signal) from cleanup_error
+        if cleanup_error is not None:
+            raise cleanup_error
 
     save(args.output_dir / "passed.json", {"mode": args.mode, "passed": True})
 
