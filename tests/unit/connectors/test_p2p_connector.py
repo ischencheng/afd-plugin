@@ -312,19 +312,19 @@ def test_p2p_tp2_maps_shared_dp_payload_one_to_one(monkeypatch):
     for connector in ffn_connectors:
 
         def record_ffn_send(
-            hidden_states,
-            dst,
+            tensors,
+            dsts,
             process_group,
             comm_id,
             *,
             connector=connector,
         ):
-            assert dst == 1
+            assert dsts == [1]
             ffn_routes.append(
-                (connector.world_rank, connector.mapping.subgroup_ranks[dst]),
+                (connector.world_rank, connector.mapping.subgroup_ranks[dsts[0]]),
             )
 
-        monkeypatch.setattr(connector, "_send_hidden_states", record_ffn_send)
+        monkeypatch.setattr(connector, "_send_tensors", record_ffn_send)
         connector.send_ffn_output(ffn_output, ffn_context)
 
     assert ffn_routes == [(0, 2), (1, 3)]
@@ -694,8 +694,8 @@ def test_p2p_recv_preserves_dynamic_ref_tensor_first_dim(monkeypatch):
     assert calls == [(ref_tensor, 0, 23)]
 
 
-def _two_peer_ffn_connector(monkeypatch, recorded):
-    """FFN rank of 2A1F with peers sending 3 and 5 tokens; records wire calls."""
+def _ffn_connector_with_peers(monkeypatch, recorded, peer_tokens):
+    """FFN rank whose Attention peers send ``peer_tokens``; records wire calls."""
     connector = AFDConnectorFactory.create_connector(
         0,
         0,
@@ -703,18 +703,20 @@ def _two_peer_ffn_connector(monkeypatch, recorded):
         AFDConfig(
             role="ffn",
             connector="P2pNcclAFDConnector",
-            num_attention_ranks=2,
+            num_attention_ranks=len(peer_tokens),
             num_ffn_ranks=1,
         ),
     )
     connector.control_plane.update_state_from_dp_metadata(
         AFDControlPayload(
-            dp_metadata_list={0: AFDDPMetadata([3, 5])},
+            dp_metadata_list={0: AFDDPMetadata(peer_tokens)},
             is_graph_capturing=False,
             is_warmup=False,
         ),
     )
-    connector.a2e_group = connector.e2a_group = SimpleNamespace(world_size=3)
+    connector.a2e_group = connector.e2a_group = SimpleNamespace(
+        world_size=len(peer_tokens) + 1,
+    )
     connector.a2e_comm_id, connector.e2a_comm_id = 5, 6
     real_empty = torch.empty
     monkeypatch.setattr(
@@ -742,23 +744,27 @@ def _two_peer_ffn_connector(monkeypatch, recorded):
         monkeypatch.setattr(
             torch.ops.vllm,
             op_name,
-            lambda *args, op_name=op_name: pytest.fail(f"{op_name} called per peer"),
+            lambda *args, op_name=op_name: pytest.fail(f"{op_name} bypassed the group"),
             raising=False,
         )
     return connector
 
 
-# One NCCL group carries every peer's tensors; within a peer the receive order
-# matches its wire order (hidden states, then router logits).
+# One NCCL group carries every peer's tensors, for one peer as well as several;
+# within a peer the receive order matches its wire order (hidden states, then
+# router logits).
 @pytest.mark.parametrize(
-    ("routing_spec", "expected_buffers", "expected_srcs"),
+    ("peer_tokens", "routing_spec", "expected_buffers", "expected_srcs"),
     [
+        ([3], None, [((3, 16), torch.bfloat16)], [1]),
         (
+            [3, 5],
             None,
             [((3, 16), torch.bfloat16), ((5, 16), torch.bfloat16)],
             [1, 2],
         ),
         (
+            [3, 5],
             "router_logits",
             [
                 ((3, 16), torch.bfloat16),
@@ -772,12 +778,13 @@ def _two_peer_ffn_connector(monkeypatch, recorded):
 )
 def test_p2p_ffn_receives_all_attention_peers_in_one_group(
     monkeypatch,
+    peer_tokens,
     routing_spec,
     expected_buffers,
     expected_srcs,
 ):
     recorded: list[tuple] = []
-    connector = _two_peer_ffn_connector(monkeypatch, recorded)
+    connector = _ffn_connector_with_peers(monkeypatch, recorded, peer_tokens)
     recv_kwargs = (
         {"routing_spec": AFDExpertRoutingSpec(4, torch.float32)} if routing_spec else {}
     )
@@ -785,34 +792,39 @@ def test_p2p_ffn_receives_all_attention_peers_in_one_group(
     payload = connector.recv_attn_output(ubatch_idx=0, **recv_kwargs)
 
     assert recorded == [("afd_p2p_recv_group", expected_buffers, expected_srcs, 5)]
-    assert tuple(payload.hidden_states.shape) == (8, 16)
-    assert payload.context.metadata.seq_lens == [3, 5]
+    assert tuple(payload.hidden_states.shape) == (sum(peer_tokens), 16)
+    assert payload.context.metadata.seq_lens == peer_tokens
     if routing_spec:
-        assert tuple(payload.router_logits.shape) == (8, 4)
+        assert tuple(payload.router_logits.shape) == (sum(peer_tokens), 4)
 
 
-def test_p2p_ffn_sends_all_attention_peers_in_one_group(monkeypatch):
+@pytest.mark.parametrize(
+    ("peer_tokens", "expected_slices", "expected_dsts"),
+    [
+        ([8], [((8, 16), torch.bfloat16)], [1]),
+        ([3, 5], [((3, 16), torch.bfloat16), ((5, 16), torch.bfloat16)], [1, 2]),
+    ],
+)
+def test_p2p_ffn_sends_all_attention_peers_in_one_group(
+    monkeypatch,
+    peer_tokens,
+    expected_slices,
+    expected_dsts,
+):
     recorded: list[tuple] = []
-    connector = _two_peer_ffn_connector(monkeypatch, recorded)
+    connector = _ffn_connector_with_peers(monkeypatch, recorded, peer_tokens)
     context = AFDTransferContext(
         metadata=AFDTransferMetadata.create_ffn_metadata(
             layer_idx=0,
             stage_idx=0,
-            seq_lens=[3, 5],
+            seq_lens=peer_tokens,
         ),
     )
 
     ffn_output = torch.zeros((8, 16), dtype=torch.bfloat16, device="meta")
     connector.send_ffn_output(ffn_output, context)
 
-    assert recorded == [
-        (
-            "afd_p2p_send_group",
-            [((3, 16), torch.bfloat16), ((5, 16), torch.bfloat16)],
-            [1, 2],
-            6,
-        ),
-    ]
+    assert recorded == [("afd_p2p_send_group", expected_slices, expected_dsts, 6)]
 
 
 def test_p2p_recv_single_rank_requires_ref_tensor():

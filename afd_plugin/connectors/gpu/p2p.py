@@ -36,10 +36,10 @@ Control and data planes:
     ``PyNcclCommunicator.send()`` / ``recv()`` on the current CUDA stream,
     wrapped in the ``torch.ops.vllm.afd_p2p_send`` / ``afd_p2p_recv`` custom
     ops so transfers stay usable under ``torch.compile`` and CUDA graph
-    capture. When the FFN rank moves several tensors in one call (one per
-    Attention peer, plus optional router logits and input IDs), the
-    ``afd_p2p_send_group`` / ``afd_p2p_recv_group`` ops issue them inside one
-    NCCL group.
+    capture. The FFN rank issues all of its receives for a layer/stage (one
+    per Attention peer, plus optional router logits and input IDs) and all of
+    its sends through the ``afd_p2p_recv_group`` / ``afd_p2p_send_group`` ops,
+    one NCCL group each, for any number of peers.
 
 Requirements and limitations:
     - Requires a CUDA-capable PyTorch/vLLM environment with NCCL and vLLM's
@@ -559,12 +559,11 @@ class P2pNcclAFDConnector(AFDConnectorBase):
     ) -> None:
         """Split the FFN output and send each slice back to its Attention peer.
 
-        With a one-to-one mapping (``ratio == 1``) the whole tensor is sent to
-        the single Attention peer. Otherwise the output is split along the
-        token dimension by ``metadata.seq_lens`` — falling back to an even
-        split when the recorded lengths do not cover every peer — and the
-        slices are sent in one NCCL group, each to the Attention rank that
-        originally produced it.
+        The output is split along the token dimension by ``metadata.seq_lens``
+        — falling back to an even split when the recorded lengths do not cover
+        every peer — and the slices are sent in one NCCL group, each to the
+        Attention rank that originally produced it. With one peer the single
+        slice is the whole tensor.
 
         Args:
             ffn_output: CUDA tensor of shape ``(num_tokens, hidden_size)``
@@ -588,10 +587,6 @@ class P2pNcclAFDConnector(AFDConnectorBase):
             raise ValueError(
                 f"ffn_output shape {ffn_output.shape!r} does not match metadata",
             )
-        if self.ratio == 1:
-            self._send_hidden_states(ffn_output, 1, self.e2a_group, self.e2a_comm_id)
-            return
-
         split_sizes = metadata.seq_lens
         if len(split_sizes) != self.ratio:
             total_tokens = ffn_output.shape[0]
@@ -656,9 +651,9 @@ class P2pNcclAFDConnector(AFDConnectorBase):
         """Send ``tensors[i]`` to subgroup rank ``dsts[i]`` in one NCCL group.
 
         Used by the FFN rank to answer all of its Attention peers at once, so
-        NCCL launches the sends together. Raises ``RuntimeError`` if the
-        connector is not initialized and ``ValueError`` for an out-of-range
-        destination or a CPU tensor.
+        NCCL launches the sends together; one peer goes through the same group
+        path. Raises ``RuntimeError`` if the connector is not initialized and
+        ``ValueError`` for an out-of-range destination or a CPU tensor.
         """
         if process_group is None or comm_id is None:
             raise RuntimeError("P2P connector is not initialized")
@@ -680,9 +675,8 @@ class P2pNcclAFDConnector(AFDConnectorBase):
         """Receive into ``buffers[i]`` from subgroup rank ``srcs[i]`` in one NCCL group.
 
         Used by the FFN rank to collect every wire tensor of every Attention
-        peer at once. A single buffer uses ``afd_p2p_recv``; several buffers
-        use ``afd_p2p_recv_group``. Buffers sharing a source are matched to
-        that peer's sends in list order.
+        peer at once, including a single tensor from a single peer. Buffers
+        sharing a source are matched to that peer's sends in list order.
         """
         if process_group is None or comm_id is None:
             raise RuntimeError("P2P connector is not initialized")
@@ -690,13 +684,6 @@ class P2pNcclAFDConnector(AFDConnectorBase):
             if src >= process_group.world_size:
                 raise ValueError(f"invalid P2P source rank {src}")
 
-        if len(buffers) == 1:
-            torch.ops.vllm.afd_p2p_recv(
-                buffers[0],
-                srcs[0],
-                comm_id,
-            )
-            return
         torch.ops.vllm.afd_p2p_recv_group(buffers, srcs, comm_id)
 
     def _recv_hidden_states(
