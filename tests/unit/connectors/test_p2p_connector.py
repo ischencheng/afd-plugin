@@ -550,14 +550,22 @@ def test_eager_state_does_not_cache_hidden_buffers(monkeypatch):
     }
 
 
-def test_p2p_custom_ops_register_send_recv_with_fake_impls(monkeypatch):
+@pytest.fixture
+def registered_p2p_ops(monkeypatch):
+    """Run the op registration against a capturing registrar.
+
+    Returns the P2P module and the ``direct_register_custom_op`` kwargs in
+    registration order, so tests can call the real op implementations.
+    """
     module = importlib.import_module("afd_plugin.connectors.gpu.p2p")
     calls = []
 
     # Empty ops namespace: the registration helper skips ops that already
     # exist on torch.ops.vllm, so the fake must report none registered.
     torch_module = SimpleNamespace(
-        Tensor=object, ops=SimpleNamespace(vllm=SimpleNamespace())
+        Tensor=object,
+        ops=SimpleNamespace(vllm=SimpleNamespace()),
+        cuda=SimpleNamespace(current_stream=lambda device: f"stream:{device}"),
     )
 
     vllm_module = types.ModuleType("vllm")
@@ -584,6 +592,11 @@ def test_p2p_custom_ops_register_send_recv_with_fake_impls(monkeypatch):
     monkeypatch.setattr(module, "_AFD_CUSTOM_OPS_REGISTERED", False)
 
     module._register_p2p_custom_ops()
+    return module, calls
+
+
+def test_p2p_custom_ops_register_send_recv_with_fake_impls(registered_p2p_ops):
+    _, calls = registered_p2p_ops
 
     assert [(call["op_name"], call["mutates_args"]) for call in calls] == [
         ("afd_p2p_send", ["tensor"]),
@@ -592,6 +605,58 @@ def test_p2p_custom_ops_register_send_recv_with_fake_impls(monkeypatch):
         ("afd_p2p_recv_group", ["outs"]),
     ]
     assert all(callable(call["fake_impl"]) for call in calls)
+
+
+class _RecordingCommunicator:
+    """Stands in for PyNcclCommunicator and records the NCCL call sequence."""
+
+    def __init__(self):
+        self.events = []
+
+    def group_start(self):
+        self.events.append("group_start")
+
+    def group_end(self):
+        self.events.append("group_end")
+
+    def send(self, tensor, dst, stream):
+        self.events.append(("send", tensor, dst, stream))
+
+    def recv(self, tensor, src, stream):
+        self.events.append(("recv", tensor, src, stream))
+
+
+# The grouped ops are the FFN rank's whole transport: every transfer, for one
+# peer or several, must sit inside a single group_start()/group_end() pair, in
+# the order given.
+@pytest.mark.parametrize(
+    ("op_name", "transfer"),
+    [("afd_p2p_send_group", "send"), ("afd_p2p_recv_group", "recv")],
+)
+@pytest.mark.parametrize("peers", [[1], [1, 2], [1, 1, 2, 2]])
+def test_p2p_group_ops_issue_transfers_inside_one_nccl_group(
+    registered_p2p_ops,
+    monkeypatch,
+    op_name,
+    transfer,
+    peers,
+):
+    module, calls = registered_p2p_ops
+    op_func = next(call["op_func"] for call in calls if call["op_name"] == op_name)
+    communicator = _RecordingCommunicator()
+    monkeypatch.setitem(module._AFD_COMMUNICATORS, 7, communicator)
+    tensors = [SimpleNamespace(device="cuda:0") for _ in peers]
+
+    op_func(tensors, peers, 7)
+
+    assert communicator.events == [
+        "group_start",
+        *[
+            (transfer, tensor, peer, "stream:cuda:0")
+            for tensor, peer in zip(tensors, peers, strict=True)
+        ],
+        "group_end",
+    ]
 
 
 def test_p2p_hidden_state_send_uses_registered_custom_op(monkeypatch):
