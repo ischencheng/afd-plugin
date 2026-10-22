@@ -244,6 +244,11 @@ class _ObservedLock:
         self._lock.release()
 
 
+# Bounds the waits below so a regression fails instead of hanging the suite;
+# the ordering itself is proven by the events and the observed lock.
+_WATCHDOG_S = 10.0
+
+
 def test_drain_started_during_a_launch_reports_that_launch(monkeypatch):
     """A drain on the shutdown thread must not miss a launch already admitted."""
     runner, _launches = _runner(monkeypatch)
@@ -254,27 +259,33 @@ def test_drain_started_during_a_launch_reports_that_launch(monkeypatch):
 
     def blocking_launch(*args):
         entered.set()
-        release.wait()
+        release.wait(_WATCHDOG_S)
 
     ops = SimpleNamespace(mega_moe_m2n_eg=blocking_launch)
     monkeypatch.setattr(runner_module, "fastafd_ops", lambda: ops)
     # The launch that is in flight when the drain starts never finishes.
     monkeypatch.setattr(_Event, "done", False)
+    drained: list[bool] = []
     submitter = threading.Thread(
         target=executor.submit, args=(_plan([1, 1]),), name="submitter"
     )
-    submitter.start()
-    entered.wait()  # the submitter now holds the lock inside its launch
-    assert lock.waiters.get() == "submitter"
-    drained: list[bool] = []
     drainer = threading.Thread(
         target=lambda: drained.append(executor.drain(0.0)), name="drainer"
     )
-    drainer.start()
-    assert lock.waiters.get() == "drainer"
-
-    release.set()
-    submitter.join()
-    drainer.join()
+    submitter.start()
+    try:
+        assert entered.wait(_WATCHDOG_S), "the launch never started"
+        assert lock.waiters.get(timeout=_WATCHDOG_S) == "submitter"
+        drainer.start()
+        try:
+            waiter = lock.waiters.get(timeout=_WATCHDOG_S)
+        except queue.Empty:
+            pytest.fail("drain did not wait for the launch in progress")
+        assert waiter == "drainer"
+    finally:
+        release.set()
+        submitter.join(_WATCHDOG_S)
+        if drainer.ident is not None:
+            drainer.join(_WATCHDOG_S)
 
     assert drained == [False]
