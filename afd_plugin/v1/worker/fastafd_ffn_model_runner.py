@@ -1,19 +1,23 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the AFD plugin project
-"""FFN runner that executes each AFD step as one FastAFD expert-kernel launch.
+"""Fused FFN execution for ``FastAFDAFDConnector``.
 
-The runner follows the megakernel FFN structure proposed for #391: the expert
-weights (``FastAFDExpertWeights``) are loaded FFN-only and converted to the
-kernel layout, and every step plan from the control plane becomes a single
+``FastAFDExpertExecutor`` is the FastAFD execution adapter: it loads this FFN
+rank's experts into the kernel layout and turns every step plan into a single
 persistent kernel launch over all MoE layers and microbatch lanes. The kernel
 receives tokens, computes the experts and writes results back by itself; the
-host never splits it into per-layer receive/compute/send.
+host never splits it into per-layer receive/compute/send. The executor holds
+no vLLM model, scheduler or graph state, so the FFN runner below only forwards
+step plans to it.
 """
 
 from __future__ import annotations
 
 import json
+import logging
 import os
+import threading
+import time
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
@@ -28,7 +32,7 @@ from afd_plugin.compat.gpu.fastafd import (
     requant_fp8_block_to_per32,
     transform_weights_for_m2n,
 )
-from afd_plugin.compat.profiler import step_afd_gpu_profiler
+from afd_plugin.compat.profiler import step_afd_gpu_profiler, stop_afd_gpu_profiler
 from afd_plugin.connectors.gpu.fastafd import FastAFDAFDConnector, M2NShape
 from afd_plugin.model_executor.models.qwen3_5 import fastafd_expert_tensor_name
 from afd_plugin.v1.worker.ffn_model_runner import GPUFFNModelRunner
@@ -39,8 +43,13 @@ if TYPE_CHECKING:
 
     from afd_plugin.connectors import AFDDPMetadata
 
+logger = logging.getLogger(__name__)
+
 # The expert kernel serves at most this many microbatch lanes per launch.
 _MAX_KERNEL_LANES = 4
+# How long shutdown waits for an in-flight step; vLLM force-kills the engine
+# after its own 10 s shutdown timeout.
+_SHUTDOWN_DRAIN_S = 5.0
 _PROJECTIONS = ("gate_proj", "up_proj", "down_proj")
 
 
@@ -67,8 +76,7 @@ class FastAFDExpertWeights:
     """
 
     def __init__(self, vllm_config: VllmConfig, shape: M2NShape, ffn_rank: int) -> None:
-        config = vllm_config.model_config.hf_text_config
-        self.num_layers = int(config.num_hidden_layers)
+        self.num_layers = shape.num_layers
         local = shape.num_experts_per_ffn_rank
         experts = range(ffn_rank * local, (ffn_rank + 1) * local)
         checkpoint = _checkpoint_dir(vllm_config)
@@ -157,67 +165,57 @@ def _read_tensors(
     return tensors
 
 
-class FastAFDFFNModelRunner(GPUFFNModelRunner):
-    """Connector-driven FFN runner for ``FastAFDAFDConnector``."""
+class FastAFDExpertExecutor:
+    """Runs one FFN rank's share of every step with the FastAFD expert kernel.
 
-    connector: FastAFDAFDConnector
+    Contract with whatever drives it (today the FFN runner):
 
-    def __init__(self, vllm_config: VllmConfig, device: torch.device) -> None:
-        super().__init__(vllm_config, device)
-        self.expert_weights: FastAFDExpertWeights | None = None
+    - ``submit(step_plan)`` launches one persistent kernel for every MoE layer
+      and every stage of the plan, on the current stream, and returns. Plans
+      must arrive in the Attention ranks' step order. A plan the connector
+      cannot serve (more stages than lanes, or a closed connector) raises
+      before anything is launched.
+    - ``drain(timeout_s)`` stops accepting steps, then waits for the last
+      submitted one and reports whether it finished; a step finishes once
+      every Attention rank has run every layer and lane of it. A submit that
+      already started completes its launch before draining begins.
+    - The caller frees the connector and the executor only after a successful
+      drain: a step that never finishes still owns the buffers and weights.
+    """
 
-    def load_model(self, *, load_dummy_weights: bool = False, **kwargs: Any) -> None:
-        """Load this rank's routed experts straight into the kernel layout."""
-        if load_dummy_weights:
-            raise ValueError("FastAFDAFDConnector needs checkpoint expert weights")
+    def __init__(self, vllm_config: VllmConfig, connector: FastAFDAFDConnector) -> None:
         fastafd_ops()
-        with DeviceMemoryProfiler() as profiler:
-            self.expert_weights = FastAFDExpertWeights(
-                self.vllm_config,
-                self.connector.shape,
-                self.connector.role_rank,
-            )
-        self.model_memory_usage = profiler.consumed_memory
+        self.connector = connector
+        self.weights = FastAFDExpertWeights(
+            vllm_config,
+            connector.shape,
+            connector.role_rank,
+        )
+        self._last_step: torch.cuda.Event | None = None
+        self._stopped = False
+        # Shutdown runs on another thread than the step loop: admission, launch
+        # and the completion event are published together under this lock.
+        self._lock = threading.Lock()
 
-    def execute_model(
-        self,
-        scheduler_output: Any = None,
-        intermediate_tensors: Any = None,
-        *,
-        dp_metadata_list: dict[int, DPMetadata | AFDDPMetadata] | None = None,
-        is_graph_capturing: bool = False,
-        is_warmup: bool = False,
-        is_graph_replaying: bool = False,
-    ) -> None:
-        step_afd_gpu_profiler(self.prof)
-        if dp_metadata_list is None:
-            raise RuntimeError("FastAFDFFNModelRunner requires dp_metadata_list")
-        # Attention records its kernels into a graph without running them, so
-        # a capture step has no expert work to serve.
-        if not is_graph_capturing:
-            self.submit_step(dp_metadata_list)
-
-    def capture_model(
-        self,
-        dp_metadata_list: dict[int, DPMetadata | AFDDPMetadata] | None = None,
-        is_warmup: bool = False,
-        is_attn_graph_capturing: bool = True,
-    ) -> int:
-        if dp_metadata_list is None:
-            raise RuntimeError("FastAFDFFNModelRunner requires dp_metadata_list")
-        if is_warmup:
-            self.submit_step(dp_metadata_list)
-        return 0
-
-    def submit_step(
-        self, dp_metadata_list: dict[int, DPMetadata | AFDDPMetadata]
-    ) -> None:
+    def submit(self, dp_metadata_list: dict[int, DPMetadata | AFDDPMetadata]) -> None:
         """Launch the expert kernel for one step: every MoE layer and lane."""
-        weights = self.expert_weights
-        assert weights is not None
+        with self._lock:
+            if self._stopped:
+                raise RuntimeError("FastAFD expert executor is shutting down")
+            self._launch(dp_metadata_list)
+            self._last_step = torch.cuda.Event()
+            self._last_step.record()
+
+    def _launch(self, dp_metadata_list: dict[int, DPMetadata | AFDDPMetadata]) -> None:
+        weights = self.weights
         connector = self.connector
         shape = connector.shape
         num_lanes = len(dp_metadata_list)
+        if not 0 < num_lanes <= len(connector.lanes):
+            raise RuntimeError(
+                f"FastAFD step plan has {num_lanes} stages, the connector "
+                f"{len(connector.lanes)} lanes",
+            )
         lanes = connector.lanes[:num_lanes]
         extra_lanes = [
             lanes[i] if i < num_lanes else None for i in range(1, _MAX_KERNEL_LANES)
@@ -254,9 +252,88 @@ class FastAFDFFNModelRunner(GPUFFNModelRunner):
             None,
         )
 
+    def drain(self, timeout_s: float) -> bool:
+        """Stop accepting steps; wait up to ``timeout_s`` for the last one."""
+        with self._lock:
+            self._stopped = True
+            last_step = self._last_step
+        if last_step is None:
+            return True
+        deadline = time.monotonic() + timeout_s
+        while not last_step.query():
+            if time.monotonic() >= deadline:
+                return False
+            time.sleep(0.001)
+        return True
+
+
+class FastAFDFFNModelRunner(GPUFFNModelRunner):
+    """Connector-driven FFN runner that forwards step plans to the executor."""
+
+    connector: FastAFDAFDConnector
+
+    def __init__(self, vllm_config: VllmConfig, device: torch.device) -> None:
+        super().__init__(vllm_config, device)
+        self.executor: FastAFDExpertExecutor | None = None
+
+    def load_model(self, *, load_dummy_weights: bool = False, **kwargs: Any) -> None:
+        """Load this rank's routed experts straight into the kernel layout."""
+        if load_dummy_weights:
+            raise ValueError("FastAFDAFDConnector needs checkpoint expert weights")
+        with DeviceMemoryProfiler() as profiler:
+            self.executor = FastAFDExpertExecutor(self.vllm_config, self.connector)
+        self.model_memory_usage = profiler.consumed_memory
+
+    def execute_model(
+        self,
+        scheduler_output: Any = None,
+        intermediate_tensors: Any = None,
+        *,
+        dp_metadata_list: dict[int, DPMetadata | AFDDPMetadata] | None = None,
+        is_graph_capturing: bool = False,
+        is_warmup: bool = False,
+        is_graph_replaying: bool = False,
+    ) -> None:
+        step_afd_gpu_profiler(self.prof)
+        if dp_metadata_list is None:
+            raise RuntimeError("FastAFDFFNModelRunner requires dp_metadata_list")
+        # Attention records its kernels into a graph without running them, so
+        # a capture step has no expert work to serve.
+        if not is_graph_capturing:
+            self._submit(dp_metadata_list)
+
+    def capture_model(
+        self,
+        dp_metadata_list: dict[int, DPMetadata | AFDDPMetadata] | None = None,
+        is_warmup: bool = False,
+        is_attn_graph_capturing: bool = True,
+    ) -> int:
+        if dp_metadata_list is None:
+            raise RuntimeError("FastAFDFFNModelRunner requires dp_metadata_list")
+        if is_warmup:
+            self._submit(dp_metadata_list)
+        return 0
+
+    def _submit(self, dp_metadata_list: dict[int, DPMetadata | AFDDPMetadata]) -> None:
+        if self.executor is None:
+            raise RuntimeError("FastAFD FFN step arrived before load_model")
+        self.executor.submit(dp_metadata_list)
+
     def shutdown(self) -> None:
-        self.expert_weights = None
+        executor = self.executor
+        if executor is not None and not executor.drain(_SHUTDOWN_DRAIN_S):
+            # A peer stopped mid-step, so the kernel is still running and owns
+            # the lane buffers and weights. Leave them to process exit.
+            logger.warning(
+                "FastAFD expert step did not finish within %.0f s; "
+                "keeping its buffers until the process exits",
+                _SHUTDOWN_DRAIN_S,
+            )
+            stop_afd_gpu_profiler(self.prof)
+            return
+        # The base shutdown closes the connector; the experts go last.
         super().shutdown()
+        self.executor = None
 
 
-__all__ = ["FastAFDExpertWeights", "FastAFDFFNModelRunner"]
+__all__ = ["FastAFDExpertExecutor", "FastAFDExpertWeights", "FastAFDFFNModelRunner"]

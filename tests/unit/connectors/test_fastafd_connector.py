@@ -24,6 +24,9 @@ CONNECTOR = "FastAFDAFDConnector"
 def _qwen_text_config(**overrides):
     values = {
         "model_type": "qwen3_5_moe_text",
+        "num_hidden_layers": 40,
+        "mlp_only_layers": [],
+        "decoder_sparse_step": 1,
         "hidden_size": 2048,
         "moe_intermediate_size": 512,
         "num_experts": 256,
@@ -33,11 +36,23 @@ def _qwen_text_config(**overrides):
     return SimpleNamespace(**values)
 
 
-def _vllm_config(*, enable_dbo=False, tensor_parallel_size=1, **text_overrides):
+_FP8_BLOCK = {"quant_method": "fp8", "weight_block_size": [128, 128]}
+
+
+def _vllm_config(
+    *,
+    enable_dbo=False,
+    tensor_parallel_size=1,
+    dtype=torch.bfloat16,
+    quantization=_FP8_BLOCK,
+    **text_overrides,
+):
     return SimpleNamespace(
         additional_config={},
         model_config=SimpleNamespace(
-            hf_text_config=_qwen_text_config(**text_overrides)
+            dtype=dtype,
+            hf_config=SimpleNamespace(quantization_config=quantization),
+            hf_text_config=_qwen_text_config(**text_overrides),
         ),
         parallel_config=SimpleNamespace(
             data_parallel_size=1,
@@ -118,6 +133,7 @@ def test_m2n_shape_reads_qwen_text_config():
     assert shape == fastafd.M2NShape(
         num_attention_ranks=2,
         num_ffn_ranks=2,
+        num_layers=40,
         num_experts=256,
         top_k=8,
         hidden_size=2048,
@@ -134,11 +150,73 @@ def test_m2n_shape_reads_qwen_text_config():
         ({"hidden_size": 2304}, "multiples of 512"),
         ({"moe_intermediate_size": 768}, "multiples of 512"),
         ({"num_experts": 255}, "divide the 255 routed experts"),
+        ({"mlp_only_layers": [3]}, "MoE block in every layer"),
+        ({"decoder_sparse_step": 2}, "MoE block in every layer"),
+        ({"dtype": torch.float16}, "bfloat16 activations"),
+        ({"quantization": None}, "FP8 checkpoint"),
+        (
+            {"quantization": {"quant_method": "fp8", "weight_block_size": None}},
+            "FP8 checkpoint",
+        ),
+        ({"quantization": {"quant_method": "awq"}}, "FP8 checkpoint"),
     ],
 )
 def test_m2n_shape_rejects_unsupported_models(overrides, message):
     with pytest.raises(ValueError, match=message):
         fastafd.m2n_shape_from_config(_vllm_config(**overrides), _afd_config())
+
+
+def _fake_all_reduce(other_rank_fields):
+    """All-reduce double that folds in one other rank's values."""
+
+    def all_reduce(bounds, op, group):
+        other = torch.tensor(list(other_rank_fields.values()), dtype=torch.int64)
+        bounds.copy_(torch.maximum(bounds, torch.cat([other, -other])))
+
+    return all_reduce
+
+
+def test_matching_ranks_pass_the_agreement_check(monkeypatch):
+    fields = {"num_lanes": 1, "num_layers": 40, "max_tokens_per_rank": 1024}
+    monkeypatch.setattr(fastafd.dist, "all_reduce", _fake_all_reduce(fields))
+
+    fastafd.check_same_across_ranks(fields, None, torch.device("cpu"))
+
+
+@pytest.mark.parametrize("field", ["num_lanes", "num_layers", "max_tokens_per_rank"])
+def test_mismatched_ranks_fail_before_any_buffer_exists(monkeypatch, field):
+    fields = {"num_lanes": 1, "num_layers": 40, "max_tokens_per_rank": 1024}
+    other = {**fields, field: fields[field] + 1}
+    monkeypatch.setattr(fastafd.dist, "all_reduce", _fake_all_reduce(other))
+
+    with pytest.raises(RuntimeError, match=f"'{field}'"):
+        fastafd.check_same_across_ranks(fields, None, torch.device("cpu"))
+
+
+def test_close_releases_buffers_and_the_union_group_once(monkeypatch):
+    destroyed: list[object] = []
+    monkeypatch.setattr(fastafd.dist, "destroy_process_group", destroyed.append)
+    connector = _connector()
+    group = object()
+    connector.group = group
+    connector.lanes = [object()]
+
+    connector.close()
+    connector.close()
+
+    assert destroyed == [group]
+    assert connector.lanes == []
+    assert not connector.is_initialized
+
+
+def test_close_before_initialization_is_a_no_op(monkeypatch):
+    monkeypatch.setattr(
+        fastafd.dist,
+        "destroy_process_group",
+        lambda group: pytest.fail("no group to destroy"),
+    )
+
+    _connector().close()
 
 
 @pytest.mark.parametrize(

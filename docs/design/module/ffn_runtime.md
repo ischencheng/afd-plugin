@@ -307,19 +307,33 @@ then aggregated for each FFN rank.
 
 `AFDFFNWorker.init_device()` installs `FastAFDFFNModelRunner` instead of
 `GPUFFNModelRunner` when the connector is `FastAFDAFDConnector`. The runner
-keeps the same worker loop and control plane, but a step is one kernel launch:
+keeps the same worker loop and control plane and forwards each step plan to
+`FastAFDExpertExecutor`, the FastAFD execution adapter, so a step is one
+kernel launch. The executor holds no vLLM model, scheduler or graph state.
 
-1. `load_model()` reads only this rank's routed experts from the FP8
+1. `load_model()` builds the executor, which reads only this rank's routed experts from the FP8
    checkpoint (`F` ranks split the experts evenly), requantizes the 128x128
    block scales to per-32 UE8M0, interleaves gate/up, and builds the per-layer
    TMA descriptors. It does not build the vLLM model, and it rejects dummy
    weights because the kernel needs real FP8 tensors.
-2. `execute_model()` launches the persistent expert kernel once for every MoE
-   layer and every stage (lane) of the plan. The kernel receives tokens,
+2. `execute_model()` has the executor launch the persistent expert kernel once
+   for every MoE layer and every stage (lane) of the plan. The kernel receives tokens,
    computes the experts and writes results to the Attention ranks by itself.
 3. Attention capture steps record kernels without running them, so the runner
    does not launch for them; warmup, profile, eager and replay steps launch.
    The runner keeps no CUDA graphs.
+4. `shutdown()` drains the last launched step for up to 5 s before closing the
+   connector and dropping the experts. If the step never finishes (a peer
+   stopped mid-step), the kernel still owns the lane buffers and weights, so
+   the runner leaves them to process exit.
+
+The executor contract is `submit(step_plan)` (one launch on the current
+stream; raises before launching when the connector cannot serve the plan) and
+`drain(timeout_s)`, which stops accepting steps and then waits for the last
+one. Admission, launch and the completion event share one lock, so a drain on
+the shutdown thread cannot miss a launch that the step-loop thread already
+started. The owner frees the connector and the executor only after a
+successful drain.
 
 ## Role-aware model loading
 

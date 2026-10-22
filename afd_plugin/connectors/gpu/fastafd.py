@@ -56,6 +56,10 @@ ATTENTION_KERNEL_SMS = 24
 FASTAFD_MODEL_TYPES = ("qwen3_5_moe_text",)
 # Hidden and expert intermediate sizes must be multiples of this (kernel layout).
 _SHAPE_ALIGNMENT = 512
+# Checkpoint FP8 block size the FFN weight conversion accepts.
+_CHECKPOINT_BLOCK = [128, 128]
+# The M2N kernels are built for SM100 (Blackwell) only.
+_SUPPORTED_SM_MAJOR = 10
 # Microbatch lanes when DBO splits a step into two ubatches.
 _DBO_LANES = 2
 # The union rank that sends each step's control payload to the FFN ranks.
@@ -73,6 +77,7 @@ class M2NShape:
 
     num_attention_ranks: int
     num_ffn_ranks: int
+    num_layers: int
     num_experts: int
     top_k: int
     hidden_size: int
@@ -116,15 +121,38 @@ class M2NLaneBuffer:
 
 def m2n_shape_from_config(vllm_config: VllmConfig, afd_config: AFDConfig) -> M2NShape:
     """M2N protocol shape of a supported model, or an actionable error."""
-    config = vllm_config.model_config.hf_text_config
+    model_config = vllm_config.model_config
+    config = model_config.hf_text_config
     if config.model_type not in FASTAFD_MODEL_TYPES:
         raise ValueError(
             f"{FASTAFD_CONNECTOR} supports model types {FASTAFD_MODEL_TYPES!r}, "
             f"got {config.model_type!r}",
         )
+    if model_config.dtype != torch.bfloat16:
+        raise ValueError(
+            f"{FASTAFD_CONNECTOR} needs bfloat16 activations, got {model_config.dtype}",
+        )
+    quantization = getattr(model_config.hf_config, "quantization_config", None) or {}
+    if (
+        quantization.get("quant_method") != "fp8"
+        or list(quantization.get("weight_block_size") or []) != _CHECKPOINT_BLOCK
+    ):
+        raise ValueError(
+            f"{FASTAFD_CONNECTOR} needs an FP8 checkpoint with "
+            f"{_CHECKPOINT_BLOCK} block scales, got quantization_config "
+            f"{quantization!r}",
+        )
+    # Every layer must be a MoE layer: the FFN kernel serves all of them.
+    if getattr(config, "mlp_only_layers", None) or (
+        int(getattr(config, "decoder_sparse_step", 1)) != 1
+    ):
+        raise ValueError(
+            f"{FASTAFD_CONNECTOR} needs a MoE block in every layer",
+        )
     shape = M2NShape(
         num_attention_ranks=afd_config.num_attention_ranks,
         num_ffn_ranks=afd_config.num_ffn_ranks,
+        num_layers=int(config.num_hidden_layers),
         num_experts=int(config.num_experts),
         top_k=int(config.num_experts_per_tok),
         hidden_size=int(config.hidden_size),
@@ -146,6 +174,29 @@ def m2n_shape_from_config(vllm_config: VllmConfig, afd_config: AFDConfig) -> M2N
             f"{shape.num_experts} routed experts, got {shape.num_ffn_ranks}",
         )
     return shape
+
+
+def check_same_across_ranks(
+    fields: dict[str, int],
+    group: ProcessGroup | None,
+    device: torch.device,
+) -> None:
+    """Raise unless every rank of ``group`` passed the same ``fields``."""
+    local = torch.tensor(list(fields.values()), dtype=torch.int64, device=device)
+    # One MAX all-reduce over (v, -v) yields every field's max and min.
+    bounds = torch.cat([local, -local])
+    dist.all_reduce(bounds, op=dist.ReduceOp.MAX, group=group)
+    values = bounds.tolist()
+    mismatched = {
+        name: (-values[len(fields) + index], values[index])
+        for index, name in enumerate(fields)
+        if values[index] != -values[len(fields) + index]
+    }
+    if mismatched:
+        raise RuntimeError(
+            f"{FASTAFD_CONNECTOR} needs the same lanes, layers and buffer shape on "
+            f"every Attention and FFN rank; (min, max) differ for {mismatched}",
+        )
 
 
 class FastAFDAFDConnector(AFDConnectorBase):
@@ -202,8 +253,11 @@ class FastAFDAFDConnector(AFDConnectorBase):
         self.control_plane = FastAFDControlPlane(self)
 
     def close(self) -> None:
+        """Release the lane buffers, then the union group. Safe to repeat."""
         self.lanes = []
-        self.group = None
+        if self.group is not None:
+            dist.destroy_process_group(self.group)
+            self.group = None
 
     def init_afd_connector(self) -> None:
         """Create the union group and the lane buffers (collective on all ranks)."""
@@ -215,7 +269,21 @@ class FastAFDAFDConnector(AFDConnectorBase):
             group_name="fastafd",
             timeout=timedelta(seconds=self.afd_config.afd_process_group_timeout_s),
         )
-        self._check_protocol_matches_across_ranks()
+        device = torch.device(f"cuda:{self.local_rank}")
+        major, minor = torch.cuda.get_device_capability(device)
+        if major != _SUPPORTED_SM_MAJOR:
+            raise RuntimeError(
+                f"{FASTAFD_CONNECTOR} runs on SM100 (Blackwell) GPUs, got "
+                f"compute capability {major}.{minor}",
+            )
+        # Each rank sizes its symmetric buffers from its own config, so a
+        # mismatch (DBO on one role only, a different max_num_batched_tokens or
+        # layer count) would otherwise hang or corrupt the kernels.
+        check_same_across_ranks(
+            {"num_lanes": self.num_lanes, **asdict(self.shape)},
+            self.group,
+            device,
+        )
         self._allow_isolated_devices_in_symmetric_memory()
         self.lanes = [
             M2NLaneBuffer(self.shape, self.group) for _ in range(self.num_lanes)
@@ -240,34 +308,6 @@ class FastAFDAFDConnector(AFDConnectorBase):
             )
         os.environ.setdefault(_SYMM_MEM_ALLOW_OVERLAP_ENV, "1")
 
-    def _check_protocol_matches_across_ranks(self) -> None:
-        """Fail fast when the roles disagree on lanes or buffer shape.
-
-        Each rank sizes its symmetric buffers from its own config, so a
-        mismatch (DBO on one role only, or a different
-        ``max_num_batched_tokens``) would otherwise hang or corrupt the kernels.
-        """
-        fields = {"num_lanes": self.num_lanes, **asdict(self.shape)}
-        local = torch.tensor(
-            list(fields.values()),
-            dtype=torch.int64,
-            device=torch.device(f"cuda:{self.local_rank}"),
-        )
-        # One MAX all-reduce over (v, -v) yields every field's max and min.
-        bounds = torch.cat([local, -local])
-        dist.all_reduce(bounds, op=dist.ReduceOp.MAX, group=self.group)
-        values = bounds.tolist()
-        mismatched = {
-            name: (-values[len(fields) + index], values[index])
-            for index, name in enumerate(fields)
-            if values[index] != -values[len(fields) + index]
-        }
-        if mismatched:
-            raise RuntimeError(
-                f"{FASTAFD_CONNECTOR} needs the same lanes and shape on every "
-                f"Attention and FFN rank; (min, max) differ for {mismatched}",
-            )
-
     @property
     def is_initialized(self) -> bool:
         return bool(self.lanes)
@@ -286,7 +326,10 @@ class FastAFDAFDConnector(AFDConnectorBase):
         the tokens, then exits, so local work can run while the FFN ranks
         compute. Every dispatch must be followed by exactly one ``combine``
         with the same inputs on the same lane, and every Attention rank must
-        run the same layers and lanes in the same order each step.
+        run the same layers and lanes in the same order each step. The lane
+        buffers serve only these split launches: the fused kernel keeps
+        different deferred-barrier state, and mixing the two on one buffer can
+        hang.
         """
         # The dispatch phase does not write the output, but the launcher
         # checks its shape.
@@ -443,5 +486,6 @@ __all__ = [
     "FastAFDControlPlane",
     "M2NLaneBuffer",
     "M2NShape",
+    "check_same_across_ranks",
     "m2n_shape_from_config",
 ]

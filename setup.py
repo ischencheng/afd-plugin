@@ -154,6 +154,14 @@ def _fastafd_build(cutlass_dir: Path, fmt_dir: Path) -> tuple[Extension, type]:
         ("cute", cutlass_dir / "include" / "cute"),
         ("cutlass", cutlass_dir / "include" / "cutlass"),
     )
+    # Notices for the code shipped with the package: the vendored kernels, the
+    # CUTLASS/CuTe headers, and fmt, which is compiled into the extension.
+    license_files = (
+        ("LICENSE.FastAFD", ROOT / _FASTAFD_SOURCE_DIR / "LICENSE.FastAFD"),
+        ("LICENSE.DeepGEMM", ROOT / _FASTAFD_SOURCE_DIR / "LICENSE.DeepGEMM"),
+        ("LICENSE.CUTLASS", cutlass_dir / "LICENSE.txt"),
+        ("LICENSE.fmt", fmt_dir / "LICENSE"),
+    )
 
     class BuildFastAFDOps(BuildExtension):
         def run(self) -> None:
@@ -164,6 +172,10 @@ def _fastafd_build(cutlass_dir: Path, fmt_dir: Path) -> tuple[Extension, type]:
                 shutil.rmtree(include_dir)
             for name, source in include_trees:
                 shutil.copytree(source, include_dir / name)
+            license_dir = include_dir.parent / "licenses"
+            license_dir.mkdir(parents=True, exist_ok=True)
+            for name, source in license_files:
+                shutil.copyfile(source, license_dir / name)
 
     return extension, BuildFastAFDOps
 

@@ -276,7 +276,7 @@ metadata is present.
 
 | Connector | Connector-owned resources | Topology constraints and mapping |
 | --- | --- | --- |
-| CUDA FastAFD | Attention-first union NCCL group, one symmetric-memory buffer per microbatch lane. | Any `A`/`F` with `A + F <= 72`, one distinct GPU per rank, TP 1 on both roles; routed experts split evenly over FFN ranks (`num_experts % F == 0`). |
+| CUDA FastAFD | Attention-first union NCCL group, one symmetric-memory buffer per microbatch lane. | `A + F <= 72` (kernel limit), one distinct GPU per rank, TP 1 on both roles; routed experts split evenly over FFN ranks (`num_experts % F == 0`). Hardware validation so far covers 1A1F only. |
 | CUDA P2P | AFD process group, PyNccl data communicators, separate NCCL metadata group, compiled custom-op communicator registry, and graph-oriented receive buffers/state. | Requires `A >= F`. One FFN rank is grouped with a consecutive block of Attention ranks in FFN-first ordering; the blocks differ in size by at most one, and hold `A/F` ranks each when `F` divides `A`. |
 | Ascend CAMP2P | AFD process group, one HCCL communication group per ubatch, FFN HCCL state, Gloo metadata group, custom-op state and transfer handles. | FFN-first ordering and `A >= F`; group construction derives each FFN/Attention mapping. |
 | Ascend CAM async | Attention-first HCCL group, plugin-owned routed-only CAM operator state, per-stage pending Attention payload queues, and connector work-item state. | Role ranks map into a combined Attention-first world; Compact metadata determines the actual layer and expert interval; counts.sum() gives this chunk’s routed token count. |
@@ -315,15 +315,19 @@ per-layer receive, compute and send.
   hidden states to per-32 UE8M0 FP8, writes each token to the FFN ranks that
   own its experts and exits. The gated shared expert then runs on Attention,
   and `combine(...)` waits for the expert outputs and reduces the top-k. Each
-  dispatch is followed by exactly one combine on the same lane. The model's
+  dispatch is followed by exactly one combine on the same lane, and the lane
+  buffers serve only these split launches (mixing them with the fused kernel
+  on one buffer can hang). The model's
   custom ops pass data dependencies through the shared expert so
   `torch.compile` keeps it between the two kernels.
 - FFN does not receive tensors from the connector. `FastAFDFFNModelRunner`
   receives the step plan and launches one persistent expert kernel that
   serves every MoE layer and lane of the step.
-- `init_afd_connector()` creates the union group, checks that every rank has
-  the same lanes and buffer shape and a distinct physical GPU, and allocates
-  one symmetric buffer per lane. Each buffer holds up to
+- Construction rejects unsupported models, dtypes and checkpoint formats.
+  `init_afd_connector()` creates the union group, checks for an SM100 GPU,
+  checks that every rank has the same lanes, layer count and buffer shape and a
+  distinct physical GPU, and allocates one symmetric buffer per lane. `close()`
+  frees the buffers and destroys the union group. Each buffer holds up to
   `max_num_batched_tokens` tokens per Attention rank (rounded up to the kernel
   token alignment), so prefill, mixed and decode steps use the same path.
 - Synchronization is device-side. Every Attention rank must run every layer
