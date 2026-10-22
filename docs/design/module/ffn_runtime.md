@@ -8,6 +8,7 @@ owners:
 primary_code_paths:
   - "afd_plugin/v1/worker/ffn_metadata.py"
   - "afd_plugin/v1/worker/ffn_model_runner.py"
+  - "afd_plugin/v1/worker/fastafd_ffn_model_runner.py"
   - "afd_plugin/v1/worker/ffn_worker.py"
   - "afd_plugin/v1/worker/npu/ffn_model_runner.py"
   - "afd_plugin/v1/worker/npu/async_ffn_model_runner.py"
@@ -26,6 +27,7 @@ depends_on:
 validation_paths:
   - "tests/unit/v1/worker/test_ffn_metadata.py"
   - "tests/unit/v1/worker/test_ffn_model_runner.py"
+  - "tests/unit/v1/worker/test_fastafd_ffn_model_runner.py"
   - "tests/unit/v1/worker/test_model_runner_v2.py"
   - "tests/unit/v1/worker/test_npu_runtime.py"
   - "tests/unit/v1/worker/test_async_ffn_two_stream.py"
@@ -82,6 +84,7 @@ Attention.
 | Platform | Worker | Model runner | Current connectors |
 | --- | --- | --- | --- |
 | CUDA | `afd_plugin.v1.worker.AFDFFNWorker` | `GPUFFNModelRunner` | `P2pNcclAFDConnector` |
+| CUDA | `afd_plugin.v1.worker.AFDFFNWorker` | `FastAFDFFNModelRunner` | `FastAFDAFDConnector` |
 | NPU | `afd_plugin.v1.worker.npu.AFDNPUFFNWorker` | `AFDNPUFFNModelRunner` (sync) or `AsyncNPUFFNModelRunner` | `CAMP2pAFDConnector`, `CAMAsyncAFDConnector` |
 
 GPU and NPU FFN runners are independent, connector-driven owners. Ascend
@@ -184,7 +187,7 @@ The worker selects one of two FFN step paths from the optional
 
 | Selection state | Connectors | Worker behavior |
 | --- | --- | --- |
-| `control_plane is not None` | `P2pNcclAFDConnector`, `CAMP2pAFDConnector` | Call `control_plane.recv_dp_metadata_list()`, then profile, warm, capture, replay, or execute its stage map. |
+| `control_plane is not None` | `P2pNcclAFDConnector`, `FastAFDAFDConnector`, `CAMP2pAFDConnector` | Call `control_plane.recv_dp_metadata_list()`, then profile, warm, capture, replay, or execute its stage map. |
 | `control_plane is None` | `CAMAsyncAFDConnector` (NPU only) | Block directly on a connector work item; no separate DP-metadata control plane. |
 
 The connector-driven path exists only on Ascend. GPU FFN supports
@@ -299,6 +302,24 @@ Ascend translates AFD-level token counts to the DP-level token-count vector
 expected by the upstream forward context. When TP expands Attention rank
 counts beyond DP metadata width, token counts are replicated per TP rank and
 then aggregated for each FFN rank.
+
+### FastAFD expert runner
+
+`AFDFFNWorker.init_device()` installs `FastAFDFFNModelRunner` instead of
+`GPUFFNModelRunner` when the connector is `FastAFDAFDConnector`. The runner
+keeps the same worker loop and control plane, but a step is one kernel launch:
+
+1. `load_model()` reads only this rank's routed experts from the FP8
+   checkpoint (`F` ranks split the experts evenly), requantizes the 128x128
+   block scales to per-32 UE8M0, interleaves gate/up, and builds the per-layer
+   TMA descriptors. It does not build the vLLM model, and it rejects dummy
+   weights because the kernel needs real FP8 tensors.
+2. `execute_model()` launches the persistent expert kernel once for every MoE
+   layer and every stage (lane) of the plan. The kernel receives tokens,
+   computes the experts and writes results to the Attention ranks by itself.
+3. Attention capture steps record kernels without running them, so the runner
+   does not launch for them; warmup, profile, eager and replay steps launch.
+   The runner keeps no CUDA graphs.
 
 ## Role-aware model loading
 
