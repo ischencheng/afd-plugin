@@ -656,9 +656,9 @@ class P2pNcclAFDConnector(AFDConnectorBase):
         """Send ``tensors[i]`` to subgroup rank ``dsts[i]`` in one NCCL group.
 
         Used by the FFN rank to answer all of its Attention peers at once, so
-        NCCL launches the sends together instead of one after another. Raises
-        ``RuntimeError`` if the connector is not initialized and
-        ``ValueError`` for an out-of-range destination or a CPU tensor.
+        NCCL launches the sends together. Raises ``RuntimeError`` if the
+        connector is not initialized and ``ValueError`` for an out-of-range
+        destination or a CPU tensor.
         """
         if process_group is None or comm_id is None:
             raise RuntimeError("P2P connector is not initialized")
