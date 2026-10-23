@@ -185,7 +185,9 @@ connector through the shared `afd_fastafd_dispatch` and `afd_fastafd_combine`
 custom ops in `fastafd_moe.py`. The copy that dispatch returns feeds combine,
 so `torch.compile` keeps the two kernels in order. FFN loads its routed experts
 through `FastAFDFFNModelRunner` and does not build the model. Every layer must
-be a MoE layer, and the checkpoint must not have shared experts.
+be a MoE layer, and the checkpoint must not have shared experts. DBO is
+rejected with this connector: the expert kernel serves every layer's lanes in
+order, which needs the two microbatches to alternate per layer.
 
 This path is CUDA-only. It requires `compute_gate_on_attention=false` with
 `P2pNcclAFDConnector` and `true` with `FastAFDAFDConnector`. It fails during

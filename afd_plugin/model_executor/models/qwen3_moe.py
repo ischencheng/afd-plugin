@@ -122,6 +122,14 @@ def _validate_supported_config(
             "AFD Qwen3 MoE routes on Attention exactly when the connector is "
             f"{FASTAFD_CONNECTOR}",
         )
+    if afd_config.connector == FASTAFD_CONNECTOR and (
+        parallel_config.enable_dbo or parallel_config.use_ubatching
+    ):
+        # The expert kernel serves every layer's lanes in order, so DBO needs
+        # the microbatches to alternate per layer; this layer does not yield.
+        raise RuntimeError(
+            f"AFD Qwen3 MoE does not support DBO with {FASTAFD_CONNECTOR}",
+        )
     if parallel_config.use_sequence_parallel_moe:
         raise RuntimeError(
             "AFD Qwen3 MoE does not support sequence-parallel MoE",

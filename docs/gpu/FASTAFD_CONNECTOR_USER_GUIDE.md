@@ -139,6 +139,6 @@ Send requests to Attention only.
   FP8 (activations and the SwiGLU intermediate are quantized too), so outputs
   differ from the native block-FP8 path at the level of that format.
 - Qwen3 MoE and Qwen3.5/3.6 MoE only. Qwen3 MoE needs a MoE block in every
-  layer (no `mlp_only_layers`). Qwen3.5/3.6 GDN does not support DBO, so these
-  models use one lane.
+  layer (no `mlp_only_layers`) and does not support DBO on this connector yet.
+  Qwen3.5/3.6 GDN does not support DBO, so these models use one lane.
 - TP 1 on both roles; no EPLB, PP or speculative decoding.

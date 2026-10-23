@@ -84,9 +84,11 @@ def _model_config(
         lora_config=None,
         model_config=SimpleNamespace(hf_text_config=config),
         parallel_config=SimpleNamespace(
+            enable_dbo=False,
             enable_eplb=False,
             pipeline_parallel_size=1,
             use_sequence_parallel_moe=False,
+            use_ubatching=False,
         ),
         quant_config=None,
         speculative_config=None,
@@ -284,6 +286,12 @@ def test_attention_causal_lm_reports_no_local_moe_modules(
             AFDConfig(connector="FastAFDAFDConnector"),
             {},
             "routes on Attention exactly when",
+        ),
+        (
+            True,
+            AFDConfig(connector="FastAFDAFDConnector", compute_gate_on_attention=True),
+            {"enable_dbo": True, "use_ubatching": True},
+            "does not support DBO",
         ),
         (
             True,
