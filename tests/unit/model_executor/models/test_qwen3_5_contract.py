@@ -94,6 +94,20 @@ def _attention_routed_moe(monkeypatch, connector, events: list[object]):
         "maybe_apply_dbo_yield",
         lambda tensor, role: tensor,
     )
+    # The custom ops are registered for the platform dispatch key, which is
+    # CUDA on GPU hosts, so call their implementations directly on CPU tensors.
+    monkeypatch.setattr(
+        adapter,
+        "torch",
+        SimpleNamespace(
+            ops=SimpleNamespace(
+                vllm=SimpleNamespace(
+                    afd_fastafd_dispatch=adapter._fastafd_dispatch,
+                    afd_fastafd_combine=adapter._fastafd_combine,
+                ),
+            ),
+        ),
+    )
     return moe
 
 
