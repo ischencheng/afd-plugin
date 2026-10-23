@@ -271,7 +271,9 @@ def load_attention_side(
     reference_weights = {}
     for layer in layers:
         name = f"{checkpoint.mlp_prefix(layer)}.gate.weight"
-        gates[layer] = checkpoint.tensors([name])[name].cuda()
+        # The Qwen3-235B-A22B FP8 checkpoint stores the gate in float32; route in
+        # bf16 like the model does.
+        gates[layer] = checkpoint.tensors([name])[name].to("cuda", torch.bfloat16)
         gate_up, gate_up_scales, down, down_scales = expert_weights(
             checkpoint, layer, range(num_experts)
         )
