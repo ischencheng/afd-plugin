@@ -710,7 +710,10 @@ sm100_mega_moe_m2n_ag_impl(void* y,
                 *sym_buffer.map(
                     workspace.get_expert_recv_count_ptr(sym_buffer.rank_idx, dst_local_expert_idx),
                     dst_rank_idx) = expert_status & 0xffffffff;
-                ptx::atomic_add_sys(
+                // AFD plugin change (FastAFD 3c71619 uses a relaxed atom here):
+                // release orders the per-source count above before the ready
+                // bits that the EG side spins on and then acquires.
+                ptx::atomic_add_rel_sys(
                     sym_buffer.map(workspace.get_expert_recv_count_sum_ptr(dst_local_expert_idx), dst_rank_idx),
                     (1ull << 32) | (expert_status & 0xffffffff));
             }

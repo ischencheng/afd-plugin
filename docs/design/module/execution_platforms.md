@@ -192,6 +192,11 @@ and live two-stage/full-replay assertions.
 `FastAFDAFDConnector` uses the FastAFD M2N MegaMoE kernels, vendored as a
 minimal subset under `csrc/gpu/fastafd` from FastAFD
 `3c7161949310b6d59d6b4cf9bf997a4935c8113b` (MIT; DeepGEMM MIT notices kept).
+Local differences from the pin: two environment variable names
+(`AFD_FASTAFD_AG_SMS`, `AFD_FASTAFD_HOST_DEBUG`), the pybind registration file
+`csrc/python_api.cpp`, and a system-scope release atomic
+(`ptx::atomic_add_rel_sys`) for the dispatch expert-count push, so the
+per-source counts are visible before the ready bits the expert kernel waits on.
 `AFD_BUILD_FASTAFD_OPS=1` builds the host extension `afd_plugin._C_fastafd`
 and installs the device headers under `afd_plugin/_fastafd/include`. The build
 fetches CUTLASS v4.2.1 and fmt 11.2.0 headers and checks their SHA-256;
