@@ -177,8 +177,9 @@ def test_m2n_shape_accepts_the_kernel_block_alignment():
     ("overrides", "message"),
     [
         ({"model_type": "deepseek_v3"}, "supports model types"),
-        ({"hidden_size": 2112}, "multiples of 128"),
-        ({"moe_intermediate_size": 704}, "multiples of 128"),
+        ({"hidden_size": 2304}, "hidden size that is a multiple of 512"),
+        ({"hidden_size": 9216}, "at most 8192"),
+        ({"moe_intermediate_size": 704}, "intermediate size that is a multiple of 128"),
         ({"num_experts": 255}, "divide the 255 routed experts"),
         ({"mlp_only_layers": [3]}, "MoE block in every layer"),
         ({"decoder_sparse_step": 2}, "MoE block in every layer"),
