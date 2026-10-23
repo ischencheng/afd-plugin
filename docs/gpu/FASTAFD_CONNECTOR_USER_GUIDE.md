@@ -100,6 +100,24 @@ bfloat16 activations, an FP8 checkpoint with 128x128 block scales, a MoE block
 in every layer, a distinct GPU per rank, and the same lanes, layer count and
 buffer shape on every rank. A mismatch fails with an error that names it.
 
+### When DBO pays off
+
+Each microbatch adds a dispatch/combine pair per layer and its own expert pass
+on the FFN ranks, so DBO only helps once the Attention work it hides is larger
+than that. vLLM splits a decode step when every Attention rank has at least
+`--dbo-decode-token-threshold` tokens (default 32). Decode step time on
+4x B200 with Qwen3-235B-A22B-FP8 (2A2F, FP8 KV cache, 8192-token prompts with
+a 7373-token shared prefix):
+
+| Decode tokens per Attention rank | 64 | 128 | 256 |
+| --- | --- | --- | --- |
+| DBO off | 33.2 ms | 39.4 ms | 49.9 ms |
+| DBO on | 37.5 ms | 40.0 ms | 42.0 ms |
+
+The two lines cross near 130 tokens per Attention rank, so set the threshold
+above that point, for example `--dbo-decode-token-threshold 192`, instead of
+the default. Sizes between 128 and 256 were not measured.
+
 ## Minimal launch shape
 
 Start both roles with `VLLM_USE_V2_MODEL_RUNNER=1`. FFN:

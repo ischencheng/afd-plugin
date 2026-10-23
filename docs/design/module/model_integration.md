@@ -184,9 +184,10 @@ With `FastAFDAFDConnector` Attention also owns the gate
 connector through the shared `afd_fastafd_dispatch` and `afd_fastafd_combine`
 custom ops in `fastafd_moe.py`. Under DBO each layer yields to the other
 microbatch between dispatch and combine, so its Attention overlaps the FFN
-ranks' expert compute; the lane is the microbatch index. The copy that
-dispatch returns passes through the yield op into combine, so `torch.compile`
-keeps the three in order. FFN loads its routed experts
+ranks' expert compute; the lane is the microbatch index. The split pays off
+only for larger decode batches (see the FastAFD guide for the threshold). The
+copy that dispatch returns passes through the yield op into combine, so
+`torch.compile` keeps the three in order. FFN loads its routed experts
 through `FastAFDFFNModelRunner` and does not build the model. Every layer must
 be a MoE layer, and the checkpoint must not have shared experts.
 
