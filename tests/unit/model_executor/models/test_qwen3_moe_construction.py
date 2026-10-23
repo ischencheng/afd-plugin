@@ -216,15 +216,17 @@ def _softmax_top_k(logits, top_k: int, renormalize: bool):
     return weights, ids.to(torch.int32)
 
 
-@pytest.mark.parametrize("norm_topk_prob", [True, False])
-@pytest.mark.parametrize(("ubatch_idx", "lane"), [(None, 0), (1, 1)])
-def test_fastafd_routed_moe_sends_the_router_top_k(
+def _routed_moe(
     monkeypatch: pytest.MonkeyPatch,
-    construction_env,
+    *,
     norm_topk_prob: bool,
     ubatch_idx: int | None,
-    lane: int,
-) -> None:
+):
+    """Layer 0's FastAFD routed MoE with a recording connector and DBO yield.
+
+    Returns the module and the ``(op, lane)`` events and routing payloads that
+    reach the connector; the yield records ``("yield", role)``.
+    """
     layer = _make_layer(
         monkeypatch,
         role="attention",
@@ -234,6 +236,16 @@ def test_fastafd_routed_moe_sends_the_router_top_k(
     )
     moe = layer.mlp
     moe.gate = _Router()
+    events: list[object] = []
+    payloads: list[tuple] = []
+    context = SimpleNamespace()
+    if ubatch_idx is not None:
+        context.ubatch_idx = ubatch_idx
+
+    def dbo_yield(tensor, *, role):
+        events.append(("yield", role))
+        return tensor
+
     monkeypatch.setattr(
         adapter,
         "fused_topk",
@@ -242,8 +254,8 @@ def test_fastafd_routed_moe_sends_the_router_top_k(
             None,
         ),
     )
-    events: list[object] = []
-    payloads: list[tuple] = []
+    monkeypatch.setattr(adapter, "torch", custom_ops_torch())
+    monkeypatch.setattr(adapter, "maybe_apply_dbo_yield", dbo_yield)
     monkeypatch.setattr(
         fastafd_moe,
         "get_afd_metadata_from_forward_context",
@@ -252,17 +264,24 @@ def test_fastafd_routed_moe_sends_the_router_top_k(
             stage_idx=0,
         ),
     )
-    context = SimpleNamespace()
-    if ubatch_idx is not None:
-        context.ubatch_idx = ubatch_idx
     monkeypatch.setattr(fastafd_moe, "get_forward_context", lambda: context)
-    monkeypatch.setattr(adapter, "torch", custom_ops_torch())
+    return moe, events, payloads
 
-    def dbo_yield(tensor, *, role):
-        events.append(("yield", role))
-        return tensor
 
-    monkeypatch.setattr(adapter, "maybe_apply_dbo_yield", dbo_yield)
+@pytest.mark.parametrize("norm_topk_prob", [True, False])
+@pytest.mark.parametrize(("ubatch_idx", "lane"), [(None, 0), (1, 1)])
+def test_fastafd_routed_moe_sends_the_router_top_k(
+    monkeypatch: pytest.MonkeyPatch,
+    construction_env,
+    norm_topk_prob: bool,
+    ubatch_idx: int | None,
+    lane: int,
+) -> None:
+    moe, events, payloads = _routed_moe(
+        monkeypatch,
+        norm_topk_prob=norm_topk_prob,
+        ubatch_idx=ubatch_idx,
+    )
     hidden_states = torch.randn(3, 16, generator=torch.Generator().manual_seed(0))
 
     output = moe(hidden_states)
