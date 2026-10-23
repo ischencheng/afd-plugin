@@ -217,10 +217,13 @@ def _softmax_top_k(logits, top_k: int, renormalize: bool):
 
 
 @pytest.mark.parametrize("norm_topk_prob", [True, False])
+@pytest.mark.parametrize(("ubatch_idx", "lane"), [(None, 0), (1, 1)])
 def test_fastafd_routed_moe_sends_the_router_top_k(
     monkeypatch: pytest.MonkeyPatch,
     construction_env,
     norm_topk_prob: bool,
+    ubatch_idx: int | None,
+    lane: int,
 ) -> None:
     layer = _make_layer(
         monkeypatch,
@@ -249,8 +252,17 @@ def test_fastafd_routed_moe_sends_the_router_top_k(
             stage_idx=0,
         ),
     )
-    monkeypatch.setattr(fastafd_moe, "get_forward_context", SimpleNamespace)
+    context = SimpleNamespace()
+    if ubatch_idx is not None:
+        context.ubatch_idx = ubatch_idx
+    monkeypatch.setattr(fastafd_moe, "get_forward_context", lambda: context)
     monkeypatch.setattr(adapter, "torch", custom_ops_torch())
+
+    def dbo_yield(tensor, *, role):
+        events.append(("yield", role))
+        return tensor
+
+    monkeypatch.setattr(adapter, "maybe_apply_dbo_yield", dbo_yield)
     hidden_states = torch.randn(3, 16, generator=torch.Generator().manual_seed(0))
 
     output = moe(hidden_states)
@@ -260,7 +272,8 @@ def test_fastafd_routed_moe_sends_the_router_top_k(
         2,
         norm_topk_prob,
     )
-    assert events == [("dispatch", 0), ("combine", 0)]
+    # The other microbatch runs between dispatch and combine (DBO stage order).
+    assert events == [("dispatch", lane), ("yield", "attention"), ("combine", lane)]
     for _op, ids, weights in payloads:
         assert torch.equal(ids, expected_ids)
         assert torch.equal(weights, expected_weights)
