@@ -13,8 +13,13 @@ from torch import nn  # noqa: E402
 from vllm.compilation.wrapper import TorchCompileWithNoGuardsWrapper  # noqa: E402
 from vllm.config import CompilationMode  # noqa: E402
 
-from afd_plugin.config import AFDConfig  # noqa: E402
+from afd_plugin.config import FASTAFD_CONNECTOR, AFDConfig  # noqa: E402
+from afd_plugin.model_executor.models import fastafd_moe  # noqa: E402
 from afd_plugin.model_executor.models import qwen3_moe as adapter  # noqa: E402
+from tests.unit.fakes.fastafd import (  # noqa: E402
+    custom_ops_torch,
+    recording_connector,
+)
 from tests.unit.fakes.model_layers import stage_type as _stage_type  # noqa: E402
 
 
@@ -22,11 +27,19 @@ class _FakeMissingLayer(nn.Module):
     pass
 
 
+class _Router(nn.Module):
+    """Router double: the first eight hidden features are the expert logits."""
+
+    def forward(self, hidden_states):
+        return hidden_states[:, :8], None
+
+
 @pytest.fixture
 def construction_env(monkeypatch: pytest.MonkeyPatch):
     calls: dict[str, list[str]] = {
         "attention": [],
         "dense": [],
+        "gate": [],
         "moe": [],
         "norm": [],
     }
@@ -50,6 +63,11 @@ def construction_env(monkeypatch: pytest.MonkeyPatch):
         bind(_stage_type("moe")),
     )
     monkeypatch.setattr(adapter.native, "RMSNorm", bind(_stage_type("norm")))
+    monkeypatch.setattr(
+        adapter.native,
+        "ReplicatedLinear",
+        bind(_stage_type("gate")),
+    )
     monkeypatch.setattr(adapter.native, "PPMissingLayer", _FakeMissingLayer)
     return calls
 
@@ -59,6 +77,7 @@ def _model_config(
     layer_count: int = 48,
     mlp_only_layers: list[int] | None = None,
     decoder_sparse_step: int = 1,
+    shared_expert_intermediate_size: int | None = None,
 ):
     config = SimpleNamespace(
         attention_bias=False,
@@ -69,6 +88,7 @@ def _model_config(
         intermediate_size=32,
         max_position_embeddings=4096,
         mlp_only_layers=mlp_only_layers or [],
+        norm_topk_prob=True,
         num_attention_heads=2,
         num_experts=8,
         num_experts_per_tok=2,
@@ -76,6 +96,7 @@ def _model_config(
         num_key_value_heads=1,
         rms_norm_eps=1e-6,
         rope_parameters={"rope_type": "default", "rope_theta": 1_000_000.0},
+        shared_expert_intermediate_size=shared_expert_intermediate_size,
         tie_word_embeddings=False,
         vocab_size=128,
     )
@@ -105,11 +126,21 @@ def _make_layer(
     role: str,
     layer_idx: int,
     vllm_config=None,
+    fastafd: bool = False,
 ):
+    afd_config = (
+        AFDConfig(
+            role=role,
+            connector=FASTAFD_CONNECTOR,
+            compute_gate_on_attention=True,
+        )
+        if fastafd
+        else AFDConfig(role=role)
+    )
     monkeypatch.setattr(
         adapter,
         "parse_afd_config",
-        lambda *_args, **_kwargs: AFDConfig(role=role),
+        lambda *_args, **_kwargs: afd_config,
     )
     if vllm_config is None:
         vllm_config = _model_config()
@@ -136,6 +167,87 @@ def test_attention_role_constructs_only_attention_and_norms(
         "input_layernorm.weight",
         "post_attention_layernorm.weight",
     }
+
+
+def test_fastafd_attention_role_builds_the_router(
+    monkeypatch: pytest.MonkeyPatch,
+    construction_env,
+) -> None:
+    layer = _make_layer(monkeypatch, role="attention", layer_idx=2, fastafd=True)
+
+    assert construction_env["gate"] == ["model.layers.2.mlp.gate"]
+    assert construction_env["moe"] == []
+    assert isinstance(layer.mlp, adapter.AFDQwen3MoeAttentionRoutedMoE)
+    assert set(dict(layer.named_parameters())) == {
+        "self_attn.weight",
+        "input_layernorm.weight",
+        "post_attention_layernorm.weight",
+        "mlp.gate.weight",
+    }
+
+
+@pytest.mark.parametrize(
+    ("layer_idx", "vllm_config", "message"),
+    [
+        (1, _model_config(mlp_only_layers=[1]), "MoE block in every layer"),
+        (0, _model_config(shared_expert_intermediate_size=64), "shared experts"),
+    ],
+)
+def test_fastafd_attention_role_rejects_unsupported_layers(
+    monkeypatch: pytest.MonkeyPatch,
+    construction_env,
+    layer_idx: int,
+    vllm_config: SimpleNamespace,
+    message: str,
+) -> None:
+    with pytest.raises(RuntimeError, match=message):
+        _make_layer(
+            monkeypatch,
+            role="attention",
+            layer_idx=layer_idx,
+            vllm_config=vllm_config,
+            fastafd=True,
+        )
+
+
+def test_fastafd_routed_moe_sends_the_router_top_k(
+    monkeypatch: pytest.MonkeyPatch,
+    construction_env,
+) -> None:
+    layer = _make_layer(monkeypatch, role="attention", layer_idx=0, fastafd=True)
+    moe = layer.mlp
+    moe.gate = _Router()
+    monkeypatch.setattr(
+        adapter,
+        "fused_topk",
+        lambda hidden_states, logits, top_k, renormalize: (
+            logits.softmax(dim=-1).topk(top_k).values,
+            logits.topk(top_k).indices.to(torch.int32),
+            None,
+        ),
+    )
+    events: list[object] = []
+    payloads: list[tuple] = []
+    monkeypatch.setattr(
+        fastafd_moe,
+        "get_afd_metadata_from_forward_context",
+        lambda: SimpleNamespace(
+            connector=recording_connector(events, payloads),
+            stage_idx=0,
+        ),
+    )
+    monkeypatch.setattr(fastafd_moe, "get_forward_context", SimpleNamespace)
+    monkeypatch.setattr(adapter, "torch", custom_ops_torch())
+    hidden_states = torch.randn(3, 16, generator=torch.Generator().manual_seed(0))
+
+    output = moe(hidden_states)
+
+    logits = hidden_states[:, :8]
+    assert events == [("dispatch", 0), ("combine", 0)]
+    for _op, ids, weights in payloads:
+        assert torch.equal(ids, logits.topk(2).indices.to(torch.int32))
+        assert torch.equal(weights, logits.softmax(dim=-1).topk(2).values)
+    assert torch.equal(output, hidden_states * 2)
 
 
 def test_ffn_role_constructs_only_native_moe(
