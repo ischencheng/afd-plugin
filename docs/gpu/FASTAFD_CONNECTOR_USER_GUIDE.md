@@ -56,7 +56,10 @@ by default.
   kernel quantizes the hidden states to per-32 UE8M0 FP8 and sends each token
   to its experts' FFN ranks, and `combine` waits for the routed results and
   reduces the top-k. On Qwen3.5/3.6 the gated shared expert runs locally
-  between the two.
+  between the two. On Qwen3 MoE with `--enable-dbo` the step splits into two
+  microbatches on separate lanes, and each layer yields between `dispatch` and
+  `combine`, so one microbatch's Attention runs while the FFN ranks compute the
+  other's experts.
 - **FFN.** `FastAFDExpertExecutor` loads only its share of routed experts
   (`num_experts / F` per rank) from the checkpoint, requantizes the block
   scales to per-32 UE8M0 (one lossy e4m3 round trip), and launches one
@@ -96,6 +99,27 @@ Each role checks at startup, before any buffer is allocated: SM100 GPU,
 bfloat16 activations, an FP8 checkpoint with 128x128 block scales, a MoE block
 in every layer, a distinct GPU per rank, and the same lanes, layer count and
 buffer shape on every rank. A mismatch fails with an error that names it.
+
+### When DBO pays off
+
+Each microbatch adds a dispatch/combine pair per layer and its own expert pass
+on the FFN ranks, so DBO only helps once the Attention work it hides is larger
+than that. vLLM splits a decode step when every Attention rank has at least
+`--dbo-decode-token-threshold` tokens (default 32). Decode step time on
+4x B200 with Qwen3-235B-A22B-FP8 (2A2F, FP8 KV cache, 8192-token prompts with
+a 7373-token shared prefix):
+
+| Decode tokens per Attention rank | 64 | 128 | 256 |
+| --- | --- | --- | --- |
+| DBO off | 33.2 ms | 39.4 ms | 49.9 ms |
+| DBO on | 37.5 ms | 40.0 ms | 42.0 ms |
+
+The two lines cross near 130 tokens per Attention rank, so for this layout set
+the threshold above that point, for example `--dbo-decode-token-threshold 192`,
+instead of the default. Sizes between 128 and 256 were not measured. The
+crossover depends on the layout: with one Attention and one FFN rank (on an
+8-layer cut of the same checkpoint) DBO was faster at 64, 128 and 256 tokens,
+so measure it for your own layout before raising the threshold.
 
 ## Minimal launch shape
 
@@ -139,6 +163,6 @@ Send requests to Attention only.
   FP8 (activations and the SwiGLU intermediate are quantized too), so outputs
   differ from the native block-FP8 path at the level of that format.
 - Qwen3 MoE and Qwen3.5/3.6 MoE only. Qwen3 MoE needs a MoE block in every
-  layer (no `mlp_only_layers`) and does not support DBO on this connector yet.
-  Qwen3.5/3.6 GDN does not support DBO, so these models use one lane.
+  layer (no `mlp_only_layers`). Qwen3.5/3.6 GDN does not support DBO, so these
+  models use one lane.
 - TP 1 on both roles; no EPLB, PP or speculative decoding.

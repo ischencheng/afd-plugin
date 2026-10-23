@@ -25,6 +25,7 @@ from afd_plugin.config import FASTAFD_CONNECTOR, AFDConfig, parse_afd_config
 # Registers torch.ops.vllm.afd_fastafd_dispatch and afd_fastafd_combine.
 from afd_plugin.model_executor.models import fastafd_moe  # noqa: F401
 from afd_plugin.model_executor.models.deepseek_v2 import RemoteFFNProxy
+from afd_plugin.v1.worker.dbo import maybe_apply_dbo_yield
 
 _ATTENTION_ROLE = frozenset(("attention",))
 _FFN_ROLE = frozenset(("ffn",))
@@ -122,14 +123,6 @@ def _validate_supported_config(
             "AFD Qwen3 MoE routes on Attention exactly when the connector is "
             f"{FASTAFD_CONNECTOR}",
         )
-    if afd_config.connector == FASTAFD_CONNECTOR and (
-        parallel_config.enable_dbo or parallel_config.use_ubatching
-    ):
-        # The expert kernel serves every layer's lanes in order, so DBO needs
-        # the microbatches to alternate per layer; this layer does not yield.
-        raise RuntimeError(
-            f"AFD Qwen3 MoE does not support DBO with {FASTAFD_CONNECTOR}",
-        )
     if parallel_config.use_sequence_parallel_moe:
         raise RuntimeError(
             "AFD Qwen3 MoE does not support sequence-parallel MoE",
@@ -180,13 +173,18 @@ class AFDQwen3MoeAttentionRoutedMoE(nn.Module):
             self.top_k,
             self.renormalize,
         )
-        # The copy that dispatch returns feeds combine, so torch.compile keeps
-        # dispatch before combine.
+        # With DBO the other microbatch runs its Attention while the FFN ranks
+        # compute this one's experts: yield after dispatch, combine after the
+        # yield. The expert kernel serves every layer's lanes in order, so the
+        # microbatches must alternate here. The copy that dispatch returns
+        # carries the order through the yield op into combine, so
+        # torch.compile keeps it.
         dispatched = torch.ops.vllm.afd_fastafd_dispatch(
             hidden_states,
             topk_ids,
             topk_weights,
         )
+        dispatched = maybe_apply_dbo_yield(dispatched, role="attention")
         return torch.ops.vllm.afd_fastafd_combine(
             dispatched,
             hidden_states,

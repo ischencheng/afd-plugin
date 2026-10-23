@@ -110,7 +110,7 @@ def test_attention_layer_rejects_shared_experts(attention_layer_env):
         )
 
 
-def _routed_moe(monkeypatch, connector, events):
+def _routed_moe(monkeypatch, connector, events, forward_context=None):
     moe = object.__new__(adapter.AFDQwen3MoeAttentionRoutedMoE)
     nn.Module.__init__(moe)
     moe.gate = lambda hidden_states: (hidden_states[:, :4], None)
@@ -130,7 +130,17 @@ def _routed_moe(monkeypatch, connector, events):
         "get_afd_metadata_from_forward_context",
         lambda: SimpleNamespace(connector=connector, stage_idx=0),
     )
-    monkeypatch.setattr(fastafd_moe, "get_forward_context", lambda: SimpleNamespace())
+    monkeypatch.setattr(
+        fastafd_moe,
+        "get_forward_context",
+        lambda: forward_context or SimpleNamespace(),
+    )
+
+    def dbo_yield(tensor, *, role):
+        events.append(("yield", role))
+        return tensor
+
+    monkeypatch.setattr(adapter, "maybe_apply_dbo_yield", dbo_yield)
     # The custom ops are registered for the platform dispatch key, which is
     # CUDA on GPU hosts, so call their implementations directly on CPU tensors.
     monkeypatch.setattr(
@@ -148,8 +158,20 @@ def _routed_moe(monkeypatch, connector, events):
     return moe
 
 
-def test_routed_moe_dispatches_then_combines_on_the_step_lane(monkeypatch):
-    events: list[tuple[str, int]] = []
+@pytest.mark.parametrize(
+    ("forward_context", "lane"),
+    [
+        (None, 0),
+        (SimpleNamespace(ubatch_idx=0), 0),
+        (SimpleNamespace(ubatch_idx=1), 1),
+    ],
+)
+def test_routed_moe_yields_between_dispatch_and_combine_on_the_ubatch_lane(
+    monkeypatch,
+    forward_context,
+    lane,
+):
+    events: list[tuple[str, object]] = []
 
     def dispatch(hidden_states, ids, weights, lane):
         events.append(("dispatch", lane))
@@ -161,12 +183,12 @@ def test_routed_moe_dispatches_then_combines_on_the_step_lane(monkeypatch):
     connector = object.__new__(FastAFDAFDConnector)
     connector.dispatch = dispatch  # type: ignore[method-assign]
     connector.combine = combine  # type: ignore[method-assign]
-    moe = _routed_moe(monkeypatch, connector, events)
+    moe = _routed_moe(monkeypatch, connector, events, forward_context)
     hidden_states = torch.arange(24, dtype=torch.float32).reshape(3, 8)
 
     output = moe(hidden_states)
 
-    assert events == [("dispatch", 0), ("combine", 0)]
+    assert events == [("dispatch", lane), ("yield", "attention"), ("combine", lane)]
     assert torch.equal(output, hidden_states * 2)
 
 

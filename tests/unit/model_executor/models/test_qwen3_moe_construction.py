@@ -289,12 +289,6 @@ def test_attention_causal_lm_reports_no_local_moe_modules(
         ),
         (
             True,
-            AFDConfig(connector="FastAFDAFDConnector", compute_gate_on_attention=True),
-            {"enable_dbo": True, "use_ubatching": True},
-            "does not support DBO",
-        ),
-        (
-            True,
             AFDConfig(),
             {"use_sequence_parallel_moe": True},
             "sequence-parallel MoE",
@@ -326,6 +320,18 @@ def test_unsupported_modes_fail_closed(
 
     with pytest.raises(RuntimeError, match=message):
         adapter._validate_supported_config(vllm_config, afd_config)
+
+
+def test_fastafd_accepts_dbo(monkeypatch: pytest.MonkeyPatch) -> None:
+    vllm_config = _model_config()
+    vllm_config.parallel_config.enable_dbo = True
+    vllm_config.parallel_config.use_ubatching = True
+    monkeypatch.setattr(adapter, "current_platform", _platform(is_cuda=True))
+
+    adapter._validate_supported_config(
+        vllm_config,
+        AFDConfig(connector="FastAFDAFDConnector", compute_gate_on_attention=True),
+    )
 
 
 def test_rocm_platform_fails_closed(monkeypatch: pytest.MonkeyPatch) -> None:
