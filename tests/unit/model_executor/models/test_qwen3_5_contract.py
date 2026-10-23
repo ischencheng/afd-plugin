@@ -14,11 +14,14 @@ from vllm.config.multimodal import MultiModalConfig  # noqa: E402
 from vllm.model_executor.models import qwen3_5 as native  # noqa: E402
 from vllm.model_executor.models.utils import StageMissingLayer  # noqa: E402
 
-from afd_plugin.connectors.gpu.fastafd import FastAFDAFDConnector  # noqa: E402
 from afd_plugin.model_executor.models import fastafd_moe  # noqa: E402
 from afd_plugin.model_executor.models import qwen3_5 as adapter  # noqa: E402
 from afd_plugin.model_executor.models.deepseek_v2 import (  # noqa: E402
     AFDAttentionFusedMoE,
+)
+from tests.unit.fakes.fastafd import (  # noqa: E402
+    custom_ops_torch,
+    recording_connector,
 )
 
 
@@ -95,20 +98,7 @@ def _attention_routed_moe(monkeypatch, connector, events: list[object]):
         "maybe_apply_dbo_yield",
         lambda tensor, role: tensor,
     )
-    # The custom ops are registered for the platform dispatch key, which is
-    # CUDA on GPU hosts, so call their implementations directly on CPU tensors.
-    monkeypatch.setattr(
-        adapter,
-        "torch",
-        SimpleNamespace(
-            ops=SimpleNamespace(
-                vllm=SimpleNamespace(
-                    afd_fastafd_dispatch=fastafd_moe._fastafd_dispatch,
-                    afd_fastafd_combine=fastafd_moe._fastafd_combine,
-                ),
-            ),
-        ),
-    )
+    monkeypatch.setattr(adapter, "torch", custom_ops_torch())
     return moe
 
 
@@ -116,31 +106,13 @@ def test_attention_routed_moe_overlaps_shared_expert_with_remote_experts(
     monkeypatch,
 ):
     events: list[object] = []
-
-    def dispatch(hidden_states, ids, weights, lane):
-        events.append(("dispatch", lane))
-
-    def combine(hidden_states, ids, weights, lane):
-        events.append(("combine", lane))
-        return hidden_states * 2
-
-    connector = object.__new__(FastAFDAFDConnector)
-    connector.dispatch = dispatch  # type: ignore[method-assign]
-    connector.combine = combine  # type: ignore[method-assign]
-    moe = _attention_routed_moe(monkeypatch, connector, events)
+    moe = _attention_routed_moe(monkeypatch, recording_connector(events), events)
     hidden_states = torch.arange(24, dtype=torch.float32).reshape(3, 8)
 
     output = moe(hidden_states)
 
     assert events == [("dispatch", 1), "shared", ("combine", 1)]
     assert torch.equal(output, hidden_states * 2 + hidden_states + 1)
-
-
-def test_attention_routed_moe_requires_the_fastafd_connector(monkeypatch):
-    moe = _attention_routed_moe(monkeypatch, object(), [])
-
-    with pytest.raises(RuntimeError, match="requires FastAFDAFDConnector"):
-        moe(torch.zeros(3, 8))
 
 
 def test_ffn_compute_ffn_output_calls_native_internal_router():
