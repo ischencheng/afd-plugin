@@ -200,8 +200,12 @@ slot in the mode the sender chose. FFN requests only the fields its
 model declares, concatenates them with the same per-peer token order as hidden
 states, and returns them in `AFDA2FTransferPayload`. A CUDA P2P FFN rank posts
 the receives for all of its Attention peers, each peer's tensors in wire order,
-as one NCCL group, and sends the output slices back as one NCCL group; each
-Attention rank still sends and receives its own tensors one at a time. The input-ID path supports
+as one NCCL group, and sends the output slices back as one NCCL group. Each
+Attention rank sends its hidden states and optional tensors, in wire order, as
+one NCCL group through a single op, then receives its own output slice. The
+single op matters under `torch.compile`: a separate send of router logits or
+input IDs has no later reader in the compiled graph and is dropped, which
+leaves the FFN rank waiting for it. The input-ID path supports
 DeepSeek V4's native hash router and has graph-stable receive buffers; it does
 not make input IDs mandatory for other models or connectors.
 

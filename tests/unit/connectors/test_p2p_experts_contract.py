@@ -102,8 +102,8 @@ def test_attention_gate_reuses_hidden_state_send_for_router_logits(monkeypatch):
     sent = []
     monkeypatch.setattr(
         connector,
-        "_send_hidden_states",
-        lambda tensor, *args: sent.append(tensor),
+        "_send_tensors",
+        lambda tensors, dsts, *args: sent.append((list(tensors), list(dsts))),
     )
 
     connector.send_attn_output(
@@ -112,7 +112,7 @@ def test_attention_gate_reuses_hidden_state_send_for_router_logits(monkeypatch):
         router_logits=router_logits,
     )
 
-    assert sent == [hidden_states, router_logits]
+    assert sent == [([hidden_states, router_logits], [0, 0])]
 
 
 def test_ffn_gate_sends_only_hidden_states(monkeypatch):
@@ -121,8 +121,8 @@ def test_ffn_gate_sends_only_hidden_states(monkeypatch):
     sent = []
     monkeypatch.setattr(
         connector,
-        "_send_hidden_states",
-        lambda tensor, *args: sent.append(tensor),
+        "_send_tensors",
+        lambda tensors, dsts, *args: sent.append((list(tensors), list(dsts))),
     )
 
     connector.send_attn_output(
@@ -130,7 +130,7 @@ def test_ffn_gate_sends_only_hidden_states(monkeypatch):
         _context(),
     )
 
-    assert sent == [hidden_states]
+    assert sent == [([hidden_states], [0])]
 
 
 def test_router_shape_is_validated_before_any_send(monkeypatch):
@@ -138,8 +138,8 @@ def test_router_shape_is_validated_before_any_send(monkeypatch):
     sent = []
     monkeypatch.setattr(
         connector,
-        "_send_hidden_states",
-        lambda tensor, *args: sent.append(tensor),
+        "_send_tensors",
+        lambda tensors, dsts, *args: sent.append((list(tensors), list(dsts))),
     )
 
     with pytest.raises(ValueError, match="equal token counts"):
@@ -226,8 +226,8 @@ def test_attention_send_orders_token_ids_after_hidden_states(monkeypatch):
     sent = []
     monkeypatch.setattr(
         connector,
-        "_send_hidden_states",
-        lambda tensor, *args: sent.append(tensor),
+        "_send_tensors",
+        lambda tensors, dsts, *args: sent.append((list(tensors), list(dsts))),
     )
 
     connector.send_attn_output(
@@ -236,7 +236,7 @@ def test_attention_send_orders_token_ids_after_hidden_states(monkeypatch):
         input_ids=input_ids,
     )
 
-    assert sent == [hidden_states, input_ids]
+    assert sent == [([hidden_states, input_ids], [0, 0])]
 
 
 def test_ffn_fan_in_preserves_input_id_peer_order_and_dtype(monkeypatch):

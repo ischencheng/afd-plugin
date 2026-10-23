@@ -283,19 +283,19 @@ def test_p2p_tp2_maps_shared_dp_payload_one_to_one(monkeypatch):
     for connector in attention_connectors:
 
         def record_attention_send(
-            hidden_states,
-            dst,
+            tensors,
+            dsts,
             process_group,
             comm_id,
             *,
             connector=connector,
         ):
-            assert dst == 0
+            assert dsts == [0]
             attention_routes.append(
-                (connector.world_rank, connector.mapping.subgroup_ranks[dst]),
+                (connector.world_rank, connector.mapping.subgroup_ranks[dsts[0]]),
             )
 
-        monkeypatch.setattr(connector, "_send_hidden_states", record_attention_send)
+        monkeypatch.setattr(connector, "_send_tensors", record_attention_send)
         connector.send_attn_output(attention_hidden_states, attention_context)
 
     assert attention_routes == [(2, 0), (3, 1)]
@@ -599,7 +599,6 @@ def test_p2p_custom_ops_register_send_recv_with_fake_impls(registered_p2p_ops):
     _, calls = registered_p2p_ops
 
     assert [(call["op_name"], call["mutates_args"]) for call in calls] == [
-        ("afd_p2p_send", ["tensor"]),
         ("afd_p2p_recv", ["out"]),
         ("afd_p2p_send_group", ["tensors"]),
         ("afd_p2p_recv_group", ["outs"]),
@@ -659,8 +658,18 @@ def test_p2p_group_ops_issue_transfers_inside_one_nccl_group(
     ]
 
 
-def test_p2p_hidden_state_send_uses_registered_custom_op(monkeypatch):
-    module = importlib.import_module("afd_plugin.connectors.gpu.p2p")
+# torch.compile drops a send op whose tensor nothing reads afterwards. Only
+# the hidden states are reused (by recv_ffn_output), so router logits and
+# input IDs survive in the compiled Attention graph only when they share the
+# hidden-state send op.
+@pytest.mark.parametrize(
+    "extra_tensors",
+    [(), ("router_logits",), ("input_ids",), ("router_logits", "input_ids")],
+)
+def test_p2p_attention_send_puts_every_wire_tensor_in_one_group(
+    monkeypatch,
+    extra_tensors,
+):
     connector = AFDConnectorFactory.create_connector(
         0,
         0,
@@ -672,36 +681,45 @@ def test_p2p_hidden_state_send_uses_registered_custom_op(monkeypatch):
             num_ffn_ranks=1,
         ),
     )
+    connector.a2e_group = SimpleNamespace(world_size=2, rank=1)
     connector.a2e_comm_id = 17
-
     calls = []
+    monkeypatch.setattr(
+        torch.ops.vllm,
+        "afd_p2p_send_group",
+        lambda tensors, dsts, comm_id: calls.append(
+            (list(tensors), list(dsts), comm_id),
+        ),
+        raising=False,
+    )
 
-    torch_module = SimpleNamespace(
-        ops=SimpleNamespace(
-            vllm=SimpleNamespace(
-                afd_p2p_send=lambda tensor, dst, comm_id: calls.append(
-                    (tensor, dst, comm_id),
-                ),
-            ),
+    def device_tensor(shape, dtype):
+        return SimpleNamespace(
+            is_cpu=False,
+            device="cuda:0",
+            shape=shape,
+            ndim=len(shape),
+            dtype=dtype,
+        )
+
+    hidden_states = device_tensor((4, 16), torch.bfloat16)
+    wire_tensors = {
+        "router_logits": device_tensor((4, 8), torch.float32),
+        "input_ids": device_tensor((4,), torch.int32),
+    }
+    kwargs = {name: wire_tensors[name] for name in extra_tensors}
+    context = AFDTransferContext(
+        metadata=AFDTransferMetadata.create_attention_metadata(
+            layer_idx=1,
+            stage_idx=0,
+            seq_len=4,
         ),
     )
-    monkeypatch.setattr(module, "torch", torch_module)
 
-    hidden_states = SimpleNamespace(
-        is_cpu=False,
-        device="cuda:0",
-        shape=(4, 16),
-        dtype="bf16",
-    )
-    output = connector._send_hidden_states(
-        hidden_states,
-        1,
-        SimpleNamespace(world_size=2, rank=0),
-        connector.a2e_comm_id,
-    )
+    connector.send_attn_output(hidden_states, context, **kwargs)
 
-    assert calls == [(hidden_states, 1, 17)]
-    assert output is None
+    expected = [hidden_states, *(wire_tensors[name] for name in extra_tensors)]
+    assert calls == [(expected, [0] * len(expected), 17)]
 
 
 def test_p2p_recv_preserves_dynamic_ref_tensor_first_dim(monkeypatch):
@@ -805,13 +823,12 @@ def _ffn_connector_with_peers(monkeypatch, recorded, peer_tokens):
 
     for op_name in ("afd_p2p_send_group", "afd_p2p_recv_group"):
         monkeypatch.setattr(torch.ops.vllm, op_name, record(op_name), raising=False)
-    for op_name in ("afd_p2p_send", "afd_p2p_recv"):
-        monkeypatch.setattr(
-            torch.ops.vllm,
-            op_name,
-            lambda *args, op_name=op_name: pytest.fail(f"{op_name} bypassed the group"),
-            raising=False,
-        )
+    monkeypatch.setattr(
+        torch.ops.vllm,
+        "afd_p2p_recv",
+        lambda *args: pytest.fail("afd_p2p_recv bypassed the group"),
+        raising=False,
+    )
     return connector
 
 

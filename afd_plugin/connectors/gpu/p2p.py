@@ -34,12 +34,15 @@ Control and data planes:
     arrival of a control-plane payload. The
     data path stays on the connector and uses
     ``PyNcclCommunicator.send()`` / ``recv()`` on the current CUDA stream,
-    wrapped in the ``torch.ops.vllm.afd_p2p_send`` / ``afd_p2p_recv`` custom
-    ops so transfers stay usable under ``torch.compile`` and CUDA graph
-    capture. The FFN rank issues all of its receives for a layer/stage (one
-    per Attention peer, plus optional router logits and input IDs) and all of
-    its sends through the ``afd_p2p_recv_group`` / ``afd_p2p_send_group`` ops,
-    one NCCL group each, for any number of peers.
+    wrapped in the ``torch.ops.vllm.afd_p2p_send_group`` /
+    ``afd_p2p_recv_group`` / ``afd_p2p_recv`` custom ops so transfers stay
+    usable under ``torch.compile`` and CUDA graph capture. An Attention rank
+    sends all of its wire tensors for a layer/stage (hidden states, plus
+    optional router logits and input IDs) in one ``afd_p2p_send_group`` and
+    receives the FFN output with ``afd_p2p_recv``. The FFN rank issues all of
+    its receives (one set per Attention peer) and all of its sends through
+    the ``afd_p2p_recv_group`` / ``afd_p2p_send_group`` ops, one NCCL group
+    each, for any number of peers.
 
 Requirements and limitations:
     - Requires a CUDA-capable PyTorch/vLLM environment with NCCL and vLLM's
@@ -368,26 +371,21 @@ class P2pNcclAFDConnector(AFDConnectorBase):
                 )
             if input_ids.dtype != _INPUT_IDS_DTYPE:
                 raise ValueError("P2P AFD input_ids must use torch.int32")
-        self._send_hidden_states(
-            hidden_states,
-            0,
+        tensors = [hidden_states]
+        if router_logits is not None:
+            tensors.append(router_logits)
+        if input_ids is not None:
+            tensors.append(input_ids)
+        # One op carries every wire tensor. recv_ffn_output reuses
+        # hidden_states, so a compiled graph keeps this op ahead of the
+        # receive. A separate router-logits or input-ID send would have no
+        # consumer there, and torch.compile drops it.
+        self._send_tensors(
+            tensors,
+            [0] * len(tensors),
             self.a2e_group,
             self.a2e_comm_id,
         )
-        if router_logits is not None:
-            self._send_hidden_states(
-                router_logits,
-                0,
-                self.a2e_group,
-                self.a2e_comm_id,
-            )
-        if input_ids is not None:
-            self._send_hidden_states(
-                input_ids,
-                0,
-                self.a2e_group,
-                self.a2e_comm_id,
-            )
 
     def recv_ffn_output(
         self,
@@ -612,35 +610,6 @@ class P2pNcclAFDConnector(AFDConnectorBase):
             start = end
         self._send_tensors(output_slices, dsts, self.e2a_group, self.e2a_comm_id)
 
-    def _send_hidden_states(
-        self,
-        hidden_states: torch.Tensor,
-        dst: int,
-        process_group: StatelessProcessGroup | None,
-        comm_id: int | None,
-    ) -> None:
-        """Send ``hidden_states`` to subgroup rank ``dst`` via the custom op.
-
-        No-ops for single-rank subgroups. Raises ``RuntimeError`` if the
-        connector is not initialized and ``ValueError`` for an out-of-range
-        destination or a CPU tensor.
-        """
-        if process_group is None or comm_id is None:
-            raise RuntimeError("P2P connector is not initialized")
-        if process_group.world_size == 1:
-            return
-        if dst >= process_group.world_size:
-            raise ValueError(f"invalid P2P destination rank {dst}")
-        if getattr(hidden_states, "is_cpu", False):
-            raise ValueError("P2P hidden states must be on GPU")
-
-        torch.ops.vllm.afd_p2p_send(
-            hidden_states,
-            dst,
-            comm_id,
-        )
-        return
-
     def _send_tensors(
         self,
         tensors: list[torch.Tensor],
@@ -650,10 +619,12 @@ class P2pNcclAFDConnector(AFDConnectorBase):
     ) -> None:
         """Send ``tensors[i]`` to subgroup rank ``dsts[i]`` in one NCCL group.
 
-        Used by the FFN rank to answer all of its Attention peers at once, so
-        NCCL launches the sends together; one peer goes through the same group
-        path. Raises ``RuntimeError`` if the connector is not initialized and
-        ``ValueError`` for an out-of-range destination or a CPU tensor.
+        Used by an Attention rank to send all of its wire tensors to its FFN
+        rank, and by the FFN rank to answer all of its Attention peers at
+        once, so NCCL launches the sends together; a single tensor goes
+        through the same group path. Raises ``RuntimeError`` if the connector
+        is not initialized and ``ValueError`` for an out-of-range destination
+        or a CPU tensor.
         """
         if process_group is None or comm_id is None:
             raise RuntimeError("P2P connector is not initialized")
@@ -979,8 +950,9 @@ def _register_comm(communicator: PyNcclCommunicator) -> int:
 def _register_p2p_custom_ops() -> None:
     """Register the AFD P2P send and receive custom ops.
 
-    The ``*_group`` variants issue a list of sends or receives between
-    ``group_start()`` and ``group_end()`` so NCCL runs them together.
+    The ``*_group`` ops issue a list of sends or receives between
+    ``group_start()`` and ``group_end()`` so NCCL runs them together; every
+    send goes through ``afd_p2p_send_group``.
     Wrapping ``PyNcclCommunicator.send()`` / ``recv()`` in custom ops with
     fake implementations keeps the transfers traceable by ``torch.compile``
     and capturable by CUDA graphs. Registration happens once per process;
@@ -990,28 +962,6 @@ def _register_p2p_custom_ops() -> None:
 
     if _AFD_CUSTOM_OPS_REGISTERED:
         return
-
-    def afd_p2p_send_impl(
-        tensor: torch.Tensor,
-        dst: int,
-        comm_id: int,
-    ) -> None:
-        communicator = _AFD_COMMUNICATORS.get(comm_id)
-        if communicator is None:
-            raise RuntimeError(f"AFD communicator id {comm_id} is not registered")
-        communicator.send(
-            tensor,
-            dst,
-            stream=torch.cuda.current_stream(tensor.device),
-        )
-        return None
-
-    def afd_p2p_send_fake(
-        tensor: torch.Tensor,
-        dst: int,
-        comm_id: int,
-    ) -> None:
-        pass
 
     def afd_p2p_recv_impl(
         out: torch.Tensor,
@@ -1095,12 +1045,6 @@ def _register_p2p_custom_ops() -> None:
             fake_impl=fake_impl,
         )
 
-    register_one(
-        op_name="afd_p2p_send",
-        op_func=afd_p2p_send_impl,
-        mutates_args=["tensor"],
-        fake_impl=afd_p2p_send_fake,
-    )
     register_one(
         op_name="afd_p2p_recv",
         op_func=afd_p2p_recv_impl,
