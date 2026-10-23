@@ -78,6 +78,7 @@ def _model_config(
     mlp_only_layers: list[int] | None = None,
     decoder_sparse_step: int = 1,
     shared_expert_intermediate_size: int | None = None,
+    norm_topk_prob: bool = True,
 ):
     config = SimpleNamespace(
         attention_bias=False,
@@ -88,7 +89,7 @@ def _model_config(
         intermediate_size=32,
         max_position_embeddings=4096,
         mlp_only_layers=mlp_only_layers or [],
-        norm_topk_prob=True,
+        norm_topk_prob=norm_topk_prob,
         num_attention_heads=2,
         num_experts=8,
         num_experts_per_tok=2,
@@ -210,19 +211,33 @@ def test_fastafd_attention_role_rejects_unsupported_layers(
         )
 
 
+def _softmax_top_k(logits, top_k: int, renormalize: bool):
+    weights, ids = logits.softmax(dim=-1).topk(top_k)
+    if renormalize:
+        weights = weights / weights.sum(dim=-1, keepdim=True)
+    return weights, ids.to(torch.int32)
+
+
+@pytest.mark.parametrize("norm_topk_prob", [True, False])
 def test_fastafd_routed_moe_sends_the_router_top_k(
     monkeypatch: pytest.MonkeyPatch,
     construction_env,
+    norm_topk_prob: bool,
 ) -> None:
-    layer = _make_layer(monkeypatch, role="attention", layer_idx=0, fastafd=True)
+    layer = _make_layer(
+        monkeypatch,
+        role="attention",
+        layer_idx=0,
+        vllm_config=_model_config(norm_topk_prob=norm_topk_prob),
+        fastafd=True,
+    )
     moe = layer.mlp
     moe.gate = _Router()
     monkeypatch.setattr(
         adapter,
         "fused_topk",
         lambda hidden_states, logits, top_k, renormalize: (
-            logits.softmax(dim=-1).topk(top_k).values,
-            logits.topk(top_k).indices.to(torch.int32),
+            *_softmax_top_k(logits, top_k, renormalize),
             None,
         ),
     )
@@ -242,11 +257,15 @@ def test_fastafd_routed_moe_sends_the_router_top_k(
 
     output = moe(hidden_states)
 
-    logits = hidden_states[:, :8]
+    expected_weights, expected_ids = _softmax_top_k(
+        hidden_states[:, :8],
+        2,
+        norm_topk_prob,
+    )
     assert events == [("dispatch", 0), ("combine", 0)]
     for _op, ids, weights in payloads:
-        assert torch.equal(ids, logits.topk(2).indices.to(torch.int32))
-        assert torch.equal(weights, logits.softmax(dim=-1).topk(2).values)
+        assert torch.equal(ids, expected_ids)
+        assert torch.equal(weights, expected_weights)
     assert torch.equal(output, hidden_states * 2)
 
 
