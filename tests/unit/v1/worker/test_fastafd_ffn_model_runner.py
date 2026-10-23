@@ -2,6 +2,8 @@
 # SPDX-FileCopyrightText: Copyright contributors to the AFD plugin project
 from __future__ import annotations
 
+import dataclasses
+import json
 import queue
 import threading
 from types import SimpleNamespace
@@ -13,10 +15,7 @@ pytest.importorskip("vllm")
 
 import afd_plugin.v1.worker.ffn_model_runner as ffn_model_runner_module  # noqa: E402
 from afd_plugin.connectors import AFDDPMetadata  # noqa: E402
-from afd_plugin.connectors.gpu.fastafd import (  # noqa: E402
-    FASTAFD_MODEL_TYPES,
-    M2NShape,
-)
+from afd_plugin.connectors.gpu.fastafd import M2NShape  # noqa: E402
 from afd_plugin.v1.worker import fastafd_ffn_model_runner as runner_module  # noqa: E402
 from afd_plugin.v1.worker.fastafd_ffn_model_runner import (  # noqa: E402
     FastAFDExpertExecutor,
@@ -152,8 +151,52 @@ def test_steps_require_a_plan(monkeypatch):
         runner.execute_model()
 
 
-def test_expert_tensor_names_cover_every_supported_model_type():
-    assert set(runner_module._EXPERT_TENSOR_NAMES) == set(FASTAFD_MODEL_TYPES)
+class _StopAfterReadError(Exception):
+    pass
+
+
+@pytest.mark.parametrize(
+    ("model_type", "layers"),
+    [
+        ("qwen3_moe", "model.layers"),
+        ("qwen3_5_moe_text", "model.language_model.layers"),
+    ],
+)
+def test_expert_weights_read_each_model_family_checkpoint_names(
+    monkeypatch, tmp_path, model_type, layers
+):
+    # FFN rank 1 of 2 owns experts 2 and 3 of the first layer.
+    names = sorted(
+        f"{layers}.0.mlp.experts.{expert}.{projection}.{kind}"
+        for expert in (2, 3)
+        for projection in ("gate_proj", "up_proj", "down_proj")
+        for kind in ("weight", "weight_scale_inv")
+    )
+    (tmp_path / "model.safetensors.index.json").write_text(
+        json.dumps({"weight_map": dict.fromkeys(names, "model.safetensors")}),
+    )
+    requested: list[str] = []
+
+    def read_tensors(checkpoint, weight_map, tensor_names):
+        requested.extend(tensor_names)
+        raise _StopAfterReadError
+
+    monkeypatch.setattr(runner_module, "_checkpoint_dir", lambda _config: tmp_path)
+    monkeypatch.setattr(runner_module, "_read_tensors", read_tensors)
+    config = SimpleNamespace(
+        model_config=SimpleNamespace(
+            hf_text_config=SimpleNamespace(model_type=model_type),
+        ),
+    )
+
+    with pytest.raises(_StopAfterReadError):
+        runner_module.FastAFDExpertWeights(
+            config,
+            dataclasses.replace(_SHAPE, num_experts=4),
+            ffn_rank=1,
+        )
+
+    assert sorted(requested) == names
 
 
 def test_dummy_weights_are_rejected():
