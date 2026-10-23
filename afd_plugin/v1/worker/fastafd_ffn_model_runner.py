@@ -18,6 +18,7 @@ import logging
 import os
 import threading
 import time
+from collections.abc import Callable
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
@@ -34,7 +35,7 @@ from afd_plugin.compat.gpu.fastafd import (
 )
 from afd_plugin.compat.profiler import step_afd_gpu_profiler, stop_afd_gpu_profiler
 from afd_plugin.connectors.gpu.fastafd import FastAFDAFDConnector, M2NShape
-from afd_plugin.model_executor.models.qwen3_5 import fastafd_expert_tensor_name
+from afd_plugin.model_executor.models import qwen3_5, qwen3_moe
 from afd_plugin.v1.worker.ffn_model_runner import GPUFFNModelRunner
 
 if TYPE_CHECKING:
@@ -51,6 +52,11 @@ _MAX_KERNEL_LANES = 4
 # after its own 10 s shutdown timeout.
 _SHUTDOWN_DRAIN_S = 5.0
 _PROJECTIONS = ("gate_proj", "up_proj", "down_proj")
+# Checkpoint name of one routed-expert tensor, per supported model type.
+_EXPERT_TENSOR_NAMES: dict[str, Callable[[int, int, str, str], str]] = {
+    "qwen3_5_moe_text": qwen3_5.fastafd_expert_tensor_name,
+    "qwen3_moe": qwen3_moe.fastafd_expert_tensor_name,
+}
 
 
 def _checkpoint_dir(vllm_config: VllmConfig) -> Path:
@@ -79,6 +85,9 @@ class FastAFDExpertWeights:
         self.num_layers = shape.num_layers
         local = shape.num_experts_per_ffn_rank
         experts = range(ffn_rank * local, (ffn_rank + 1) * local)
+        tensor_name = _EXPERT_TENSOR_NAMES[
+            vllm_config.model_config.hf_text_config.model_type
+        ]
         checkpoint = _checkpoint_dir(vllm_config)
         weight_map = json.loads(
             (checkpoint / "model.safetensors.index.json").read_text()
@@ -88,7 +97,9 @@ class FastAFDExpertWeights:
         ] = []
         descriptors = []
         for layer in range(self.num_layers):
-            l1, l2 = _load_layer_experts(checkpoint, weight_map, layer, experts)
+            l1, l2 = _load_layer_experts(
+                checkpoint, weight_map, tensor_name, layer, experts
+            )
             self.layers.append((l1, l2))
             descriptors.append(
                 make_weight_descriptors(
@@ -111,6 +122,7 @@ class FastAFDExpertWeights:
 def _load_layer_experts(
     checkpoint: Path,
     weight_map: dict[str, str],
+    tensor_name: Callable[[int, int, str, str], str],
     layer: int,
     experts: range,
 ) -> tuple[tuple[torch.Tensor, torch.Tensor], tuple[torch.Tensor, torch.Tensor]]:
@@ -119,7 +131,7 @@ def _load_layer_experts(
         checkpoint,
         weight_map,
         [
-            fastafd_expert_tensor_name(layer, expert, projection, kind)
+            tensor_name(layer, expert, projection, kind)
             for expert in experts
             for projection in _PROJECTIONS
             for kind in ("weight", "weight_scale_inv")
@@ -129,7 +141,7 @@ def _load_layer_experts(
     def stack(projection: str, kind: str) -> torch.Tensor:
         return torch.stack(
             [
-                tensors[fastafd_expert_tensor_name(layer, expert, projection, kind)]
+                tensors[tensor_name(layer, expert, projection, kind)]
                 for expert in experts
             ]
         ).cuda()

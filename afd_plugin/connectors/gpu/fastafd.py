@@ -53,9 +53,14 @@ _BARRIER_SIGNAL_BYTES = slice(20, 24)
 # a small grid leaves SMs to the shared expert and other microbatches.
 ATTENTION_KERNEL_SMS = 24
 # Model families whose MoE layout the connector and the FFN runner support.
-FASTAFD_MODEL_TYPES = ("qwen3_5_moe_text",)
-# Hidden and expert intermediate sizes must be multiples of this (kernel layout).
+FASTAFD_MODEL_TYPES = ("qwen3_5_moe_text", "qwen3_moe")
+# Hidden and expert intermediate sizes must be multiples of this: the symmetric
+# buffer keeps one UE8M0 scale byte per 32 values of each, and TMA needs those
+# rows 16-byte aligned (csrc/apis/mega_m2n.hpp, layout/mega_moe.cuh).
 _SHAPE_ALIGNMENT = 512
+# The Attention kernel's combine splits each hidden row into at most two chunks
+# of at most 4096 elements (sm100_mega_moe_m2n.cuh).
+_MAX_HIDDEN_SIZE = 8192
 # Checkpoint FP8 block size the FFN weight conversion accepts.
 _CHECKPOINT_BLOCK = [128, 128]
 # The M2N kernels are built for SM100 (Blackwell) only.
@@ -167,6 +172,11 @@ def m2n_shape_from_config(vllm_config: VllmConfig, afd_config: AFDConfig) -> M2N
             f"{FASTAFD_CONNECTOR} needs hidden and MoE intermediate sizes that "
             f"are multiples of {_SHAPE_ALIGNMENT}, got {shape.hidden_size} and "
             f"{shape.intermediate_size}",
+        )
+    if shape.hidden_size > _MAX_HIDDEN_SIZE:
+        raise ValueError(
+            f"{FASTAFD_CONNECTOR} needs a hidden size of at most "
+            f"{_MAX_HIDDEN_SIZE}, got {shape.hidden_size}",
         )
     if shape.num_experts % shape.num_ffn_ranks:
         raise ValueError(

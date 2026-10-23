@@ -313,13 +313,13 @@ per-layer receive, compute and send.
   renormalization). For each MoE layer and microbatch lane it calls
   `dispatch(hidden, topk_ids, topk_weights, lane)`, whose kernel quantizes the
   hidden states to per-32 UE8M0 FP8, writes each token to the FFN ranks that
-  own its experts and exits. The gated shared expert then runs on Attention,
-  and `combine(...)` waits for the expert outputs and reduces the top-k. Each
+  own its experts and exits. On Qwen3.5/3.6 the gated shared expert then runs
+  on Attention, and `combine(...)` waits for the expert outputs and reduces the top-k. Each
   dispatch is followed by exactly one combine on the same lane, and the lane
   buffers serve only these split launches (mixing them with the fused kernel
   on one buffer can hang). The model's
-  custom ops pass data dependencies through the shared expert so
-  `torch.compile` keeps it between the two kernels.
+  custom ops pass data dependencies from dispatch to combine (through the
+  shared expert when there is one) so `torch.compile` keeps them in order.
 - FFN does not receive tensors from the connector. `FastAFDFFNModelRunner`
   receives the step plan and launches one persistent expert kernel that
   serves every MoE layer and lane of the step.

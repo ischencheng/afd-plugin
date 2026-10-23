@@ -277,7 +277,13 @@ def test_attention_causal_lm_reports_no_local_moe_modules(
             True,
             AFDConfig(compute_gate_on_attention=True),
             {},
-            "compute_gate_on_attention=false",
+            "routes on Attention exactly when",
+        ),
+        (
+            True,
+            AFDConfig(connector="FastAFDAFDConnector"),
+            {},
+            "routes on Attention exactly when",
         ),
         (
             True,

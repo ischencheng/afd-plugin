@@ -9,6 +9,8 @@ Attention-first union layout:
     torchrun --nproc-per-node 2 -m tests.e2e.operators.fastafd_m2n_reference \
         --model /path/to/Qwen3.6-35B-A3B-FP8 --output /logs/fastafd-m2n
 
+``--model`` takes a Qwen3.5/3.6 MoE or Qwen3 MoE FP8 checkpoint.
+
 FFN ranks requantize their checkpoint experts with the plugin helpers and run
 one persistent expert kernel per step over all selected layers and lanes.
 Attention ranks route fixed inputs and run the Attention kernels per layer and
@@ -87,6 +89,12 @@ class Checkpoint:
         self.index = json.loads((model / "model.safetensors.index.json").read_text())[
             "weight_map"
         ]
+        # Qwen3.5/3.6 nest the text model under language_model; Qwen3 MoE does not.
+        nested = any(name.startswith("model.language_model.") for name in self.index)
+        self.layers = "model.language_model.layers" if nested else "model.layers"
+
+    def mlp_prefix(self, layer: int) -> str:
+        return f"{self.layers}.{layer}.mlp"
 
     def tensors(self, names: list[str]) -> dict[str, torch.Tensor]:
         by_file: dict[str, list[str]] = {}
@@ -100,15 +108,11 @@ class Checkpoint:
         return out
 
 
-def layer_prefix(layer: int) -> str:
-    return f"model.language_model.layers.{layer}.mlp"
-
-
 def expert_weights(
     checkpoint: Checkpoint, layer: int, experts: range
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     """Stacked FP8 ``gate_up [E, 2I, H]``, ``down [E, H, I]`` and block scales."""
-    prefix = layer_prefix(layer)
+    prefix = checkpoint.mlp_prefix(layer)
     names = [
         f"{prefix}.experts.{expert}.{proj}.{kind}"
         for expert in experts
@@ -266,8 +270,10 @@ def load_attention_side(
     gates = {}
     reference_weights = {}
     for layer in layers:
-        name = f"{layer_prefix(layer)}.gate.weight"
-        gates[layer] = checkpoint.tensors([name])[name].cuda()
+        name = f"{checkpoint.mlp_prefix(layer)}.gate.weight"
+        # The Qwen3-235B-A22B FP8 checkpoint stores the gate in float32; route in
+        # bf16 like the model does.
+        gates[layer] = checkpoint.tensors([name])[name].to("cuda", torch.bfloat16)
         gate_up, gate_up_scales, down, down_scales = expert_weights(
             checkpoint, layer, range(num_experts)
         )

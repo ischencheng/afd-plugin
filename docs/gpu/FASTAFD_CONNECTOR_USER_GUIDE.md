@@ -17,9 +17,12 @@ The kernels are vendored from FastAFD
 - Blackwell GPUs (SM100) in one NVLink domain, one GPU per Attention or FFN
   rank, `num_attention_ranks + num_ffn_ranks <= 72`. Validated so far on one
   Attention and one FFN rank (2xB200).
-- A supported model with FP8 checkpoint weights. Currently Qwen3.5/3.6 MoE
-  (`qwen3_5_moe_text`) FP8 checkpoints with 128x128 block scales, such as
-  `Qwen/Qwen3.6-35B-A3B-FP8`.
+- A supported model with FP8 checkpoint weights: Qwen3 MoE (`qwen3_moe`) or
+  Qwen3.5/3.6 MoE (`qwen3_5_moe_text`) FP8 checkpoints with 128x128 block
+  scales, such as `Qwen/Qwen3-235B-A22B-FP8` or `Qwen/Qwen3.6-35B-A3B-FP8`.
+  The hidden size and the expert intermediate size must be multiples of 512,
+  and the hidden size at most 8192 (so `Qwen/Qwen3-30B-A3B-FP8`, with 768, is
+  not supported).
 - Prefill, mixed and decode steps all use the same kernels. Attention supports
   eager and `FULL_DECODE_ONLY` CUDA graphs.
 
@@ -51,8 +54,9 @@ by default.
 - **Attention.** The Qwen MoE block computes the native router (softmax top-k,
   renormalized when `norm_topk_prob` is set). The connector's `dispatch`
   kernel quantizes the hidden states to per-32 UE8M0 FP8 and sends each token
-  to its experts' FFN ranks; the gated shared expert runs locally meanwhile,
-  and `combine` waits for the routed results and reduces the top-k.
+  to its experts' FFN ranks, and `combine` waits for the routed results and
+  reduces the top-k. On Qwen3.5/3.6 the gated shared expert runs locally
+  between the two.
 - **FFN.** `FastAFDExpertExecutor` loads only its share of routed experts
   (`num_experts / F` per rank) from the checkpoint, requantizes the block
   scales to per-32 UE8M0 (one lossy e4m3 round trip), and launches one
@@ -134,6 +138,7 @@ Send requests to Attention only.
 - FP8 block-scaled checkpoints only. The routed experts run in per-32 UE8M0
   FP8 (activations and the SwiGLU intermediate are quantized too), so outputs
   differ from the native block-FP8 path at the level of that format.
-- Qwen3.5/3.6 MoE only. Qwen3.5/3.6 GDN does not support DBO, so these models
-  use one lane.
+- Qwen3 MoE and Qwen3.5/3.6 MoE only. Qwen3 MoE needs a MoE block in every
+  layer (no `mlp_only_layers`). Qwen3.5/3.6 GDN does not support DBO, so these
+  models use one lane.
 - TP 1 on both roles; no EPLB, PP or speculative decoding.

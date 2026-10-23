@@ -49,7 +49,9 @@ must be reported as such rather than treated as evidence of accuracy.
 ## FastAFD M2N kernel parity (SM100)
 
 `fastafd_m2n_reference` checks the FastAFD dispatch/combine and expert kernels
-on two Blackwell GPUs with real experts from an FP8 Qwen3.5/3.6 checkpoint.
+on two Blackwell GPUs with real experts from an FP8 Qwen3.5/3.6 or Qwen3 MoE
+checkpoint (for example `Qwen/Qwen3-235B-A22B-FP8`; `--layers` picks the
+layers to load).
 Build the extension in place first:
 
 ```bash
