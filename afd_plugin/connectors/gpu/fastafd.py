@@ -54,14 +54,13 @@ _BARRIER_SIGNAL_BYTES = slice(20, 24)
 ATTENTION_KERNEL_SMS = 24
 # Model families whose MoE layout the connector and the FFN runner support.
 FASTAFD_MODEL_TYPES = ("qwen3_5_moe_text", "qwen3_moe")
-# The Attention kernel's combine splits each hidden row into one chunk, or two
-# once three slots per combine warp no longer fit its shared memory, and each
-# chunk must be a multiple of 32 x 16 bytes with at most 4096 elements
-# (sm100_mega_moe_m2n.cuh). A multiple of 512 up to 8192 satisfies both cases.
-_HIDDEN_ALIGNMENT = 512
+# Hidden and expert intermediate sizes must be multiples of this: the symmetric
+# buffer keeps one UE8M0 scale byte per 32 values of each, and TMA needs those
+# rows 16-byte aligned (csrc/apis/mega_m2n.hpp, layout/mega_moe.cuh).
+_SHAPE_ALIGNMENT = 512
+# The Attention kernel's combine splits each hidden row into at most two chunks
+# of at most 4096 elements (sm100_mega_moe_m2n.cuh).
 _MAX_HIDDEN_SIZE = 8192
-# The expert intermediate size only needs the kernels' 128 block (mega_m2n.hpp).
-_INTERMEDIATE_ALIGNMENT = 128
 # Checkpoint FP8 block size the FFN weight conversion accepts.
 _CHECKPOINT_BLOCK = [128, 128]
 # The M2N kernels are built for SM100 (Blackwell) only.
@@ -165,16 +164,19 @@ def m2n_shape_from_config(vllm_config: VllmConfig, afd_config: AFDConfig) -> M2N
         intermediate_size=int(config.moe_intermediate_size),
         max_tokens_per_rank=int(vllm_config.scheduler_config.max_num_batched_tokens),
     )
-    if shape.hidden_size % _HIDDEN_ALIGNMENT or shape.hidden_size > _MAX_HIDDEN_SIZE:
+    if (
+        shape.hidden_size % _SHAPE_ALIGNMENT
+        or shape.intermediate_size % _SHAPE_ALIGNMENT
+    ):
         raise ValueError(
-            f"{FASTAFD_CONNECTOR} needs a hidden size that is a multiple of "
-            f"{_HIDDEN_ALIGNMENT} and at most {_MAX_HIDDEN_SIZE}, got "
-            f"{shape.hidden_size}",
+            f"{FASTAFD_CONNECTOR} needs hidden and MoE intermediate sizes that "
+            f"are multiples of {_SHAPE_ALIGNMENT}, got {shape.hidden_size} and "
+            f"{shape.intermediate_size}",
         )
-    if shape.intermediate_size % _INTERMEDIATE_ALIGNMENT:
+    if shape.hidden_size > _MAX_HIDDEN_SIZE:
         raise ValueError(
-            f"{FASTAFD_CONNECTOR} needs a MoE intermediate size that is a "
-            f"multiple of {_INTERMEDIATE_ALIGNMENT}, got {shape.intermediate_size}",
+            f"{FASTAFD_CONNECTOR} needs a hidden size of at most "
+            f"{_MAX_HIDDEN_SIZE}, got {shape.hidden_size}",
         )
     if shape.num_experts % shape.num_ffn_ranks:
         raise ValueError(
