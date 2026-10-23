@@ -114,9 +114,12 @@ a 7373-token shared prefix):
 | DBO off | 33.2 ms | 39.4 ms | 49.9 ms |
 | DBO on | 37.5 ms | 40.0 ms | 42.0 ms |
 
-The two lines cross near 130 tokens per Attention rank, so set the threshold
-above that point, for example `--dbo-decode-token-threshold 192`, instead of
-the default. Sizes between 128 and 256 were not measured.
+The two lines cross near 130 tokens per Attention rank, so for this layout set
+the threshold above that point, for example `--dbo-decode-token-threshold 192`,
+instead of the default. Sizes between 128 and 256 were not measured. The
+crossover depends on the layout: with one Attention and one FFN rank (on an
+8-layer cut of the same checkpoint) DBO was faster at 64, 128 and 256 tokens,
+so measure it for your own layout before raising the threshold.
 
 ## Minimal launch shape
 
