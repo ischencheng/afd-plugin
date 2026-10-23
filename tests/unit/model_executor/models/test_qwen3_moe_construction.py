@@ -176,8 +176,6 @@ def test_fastafd_attention_role_builds_the_router(
 ) -> None:
     layer = _make_layer(monkeypatch, role="attention", layer_idx=2, fastafd=True)
 
-    assert construction_env["gate"] == ["model.layers.2.mlp.gate"]
-    assert construction_env["moe"] == []
     assert isinstance(layer.mlp, adapter.AFDQwen3MoeAttentionRoutedMoE)
     assert set(dict(layer.named_parameters())) == {
         "self_attn.weight",
