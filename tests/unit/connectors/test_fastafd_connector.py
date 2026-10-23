@@ -163,23 +163,14 @@ def test_m2n_shape_reads_qwen3_moe_config():
     assert shape.num_experts_per_ffn_rank == 64
 
 
-def test_m2n_shape_accepts_the_kernel_block_alignment():
-    # 768 is a multiple of the kernel's 128 block but not of 512.
-    shape = fastafd.m2n_shape_from_config(
-        _vllm_config(model_type="qwen3_moe", moe_intermediate_size=768),
-        _afd_config(),
-    )
-
-    assert shape.intermediate_size == 768
-
-
 @pytest.mark.parametrize(
     ("overrides", "message"),
     [
         ({"model_type": "deepseek_v3"}, "supports model types"),
-        ({"hidden_size": 2304}, "hidden size that is a multiple of 512"),
+        ({"hidden_size": 2304}, "multiples of 512"),
         ({"hidden_size": 9216}, "at most 8192"),
-        ({"moe_intermediate_size": 704}, "intermediate size that is a multiple of 128"),
+        # Qwen3-30B-A3B: a multiple of the 128 block, not of 512.
+        ({"moe_intermediate_size": 768}, "multiples of 512"),
         ({"num_experts": 255}, "divide the 255 routed experts"),
         ({"mlp_only_layers": [3]}, "MoE block in every layer"),
         ({"decoder_sparse_step": 2}, "MoE block in every layer"),

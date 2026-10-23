@@ -20,8 +20,9 @@ The kernels are vendored from FastAFD
 - A supported model with FP8 checkpoint weights: Qwen3 MoE (`qwen3_moe`) or
   Qwen3.5/3.6 MoE (`qwen3_5_moe_text`) FP8 checkpoints with 128x128 block
   scales, such as `Qwen/Qwen3-235B-A22B-FP8` or `Qwen/Qwen3.6-35B-A3B-FP8`.
-  The hidden size must be a multiple of 512 (at most 8192) and the expert
-  intermediate size a multiple of 128.
+  The hidden size and the expert intermediate size must be multiples of 512,
+  and the hidden size at most 8192 (so `Qwen/Qwen3-30B-A3B-FP8`, with 768, is
+  not supported).
 - Prefill, mixed and decode steps all use the same kernels. Attention supports
   eager and `FULL_DECODE_ONLY` CUDA graphs.
 
