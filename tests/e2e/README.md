@@ -211,6 +211,12 @@ AFD_E2E_BACKEND=gpu python -m tests.e2e.runner \
   --gsm8k-output-path /tmp/fastafd-gsm8k
 ```
 
+With a Qwen3 MoE checkpoint the `afd-v2-eager-dbo-dp2` and
+`afd-v2-graph-dbo-dp2` scenarios run FastAFD with DBO on four Blackwell GPUs
+(2A2F, two microbatch lanes): pass `--attention-devices 0,1 --ffn-devices 2,3`
+and the same connector flags. The per-rank summaries described below report
+whether every Attention rank ran both stages.
+
 ### GPU MRV2 DBO development comparison
 
 The `afd-v2-eager-dbo-dp2` and `afd-v2-graph-dbo-dp2` scenarios cover
