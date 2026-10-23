@@ -53,9 +53,10 @@ _BARRIER_SIGNAL_BYTES = slice(20, 24)
 # a small grid leaves SMs to the shared expert and other microbatches.
 ATTENTION_KERNEL_SMS = 24
 # Model families whose MoE layout the connector and the FFN runner support.
-FASTAFD_MODEL_TYPES = ("qwen3_5_moe_text",)
-# Hidden and expert intermediate sizes must be multiples of this (kernel layout).
-_SHAPE_ALIGNMENT = 512
+FASTAFD_MODEL_TYPES = ("qwen3_5_moe_text", "qwen3_moe")
+# Hidden and expert intermediate sizes must be multiples of this: the M2N
+# kernels' block size, checked again by the kernel API (csrc/apis/mega_m2n.hpp).
+_SHAPE_ALIGNMENT = 128
 # Checkpoint FP8 block size the FFN weight conversion accepts.
 _CHECKPOINT_BLOCK = [128, 128]
 # The M2N kernels are built for SM100 (Blackwell) only.

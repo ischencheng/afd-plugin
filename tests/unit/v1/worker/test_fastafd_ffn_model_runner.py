@@ -13,7 +13,10 @@ pytest.importorskip("vllm")
 
 import afd_plugin.v1.worker.ffn_model_runner as ffn_model_runner_module  # noqa: E402
 from afd_plugin.connectors import AFDDPMetadata  # noqa: E402
-from afd_plugin.connectors.gpu.fastafd import M2NShape  # noqa: E402
+from afd_plugin.connectors.gpu.fastafd import (  # noqa: E402
+    FASTAFD_MODEL_TYPES,
+    M2NShape,
+)
 from afd_plugin.v1.worker import fastafd_ffn_model_runner as runner_module  # noqa: E402
 from afd_plugin.v1.worker.fastafd_ffn_model_runner import (  # noqa: E402
     FastAFDExpertExecutor,
@@ -147,6 +150,10 @@ def test_steps_require_a_plan(monkeypatch):
 
     with pytest.raises(RuntimeError, match="requires dp_metadata_list"):
         runner.execute_model()
+
+
+def test_expert_tensor_names_cover_every_supported_model_type():
+    assert set(runner_module._EXPERT_TENSOR_NAMES) == set(FASTAFD_MODEL_TYPES)
 
 
 def test_dummy_weights_are_rejected():

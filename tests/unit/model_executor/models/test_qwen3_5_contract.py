@@ -15,6 +15,7 @@ from vllm.model_executor.models import qwen3_5 as native  # noqa: E402
 from vllm.model_executor.models.utils import StageMissingLayer  # noqa: E402
 
 from afd_plugin.connectors.gpu.fastafd import FastAFDAFDConnector  # noqa: E402
+from afd_plugin.model_executor.models import fastafd_moe  # noqa: E402
 from afd_plugin.model_executor.models import qwen3_5 as adapter  # noqa: E402
 from afd_plugin.model_executor.models.deepseek_v2 import (  # noqa: E402
     AFDAttentionFusedMoE,
@@ -84,11 +85,11 @@ def _attention_routed_moe(monkeypatch, connector, events: list[object]):
         ),
     )
     monkeypatch.setattr(
-        adapter,
+        fastafd_moe,
         "get_afd_metadata_from_forward_context",
         lambda: SimpleNamespace(connector=connector, stage_idx=1),
     )
-    monkeypatch.setattr(adapter, "get_forward_context", lambda: SimpleNamespace())
+    monkeypatch.setattr(fastafd_moe, "get_forward_context", lambda: SimpleNamespace())
     monkeypatch.setattr(
         adapter,
         "maybe_apply_dbo_yield",
@@ -102,8 +103,8 @@ def _attention_routed_moe(monkeypatch, connector, events: list[object]):
         SimpleNamespace(
             ops=SimpleNamespace(
                 vllm=SimpleNamespace(
-                    afd_fastafd_dispatch=adapter._fastafd_dispatch,
-                    afd_fastafd_combine=adapter._fastafd_combine,
+                    afd_fastafd_dispatch=fastafd_moe._fastafd_dispatch,
+                    afd_fastafd_combine=fastafd_moe._fastafd_combine,
                 ),
             ),
         ),
