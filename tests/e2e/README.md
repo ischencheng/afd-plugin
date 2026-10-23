@@ -193,7 +193,7 @@ python -m pytest -q -s \
 ### FastAFD connector (SM100)
 
 `FastAFDAFDConnector` runs the same 1A1F scenarios on two Blackwell GPUs with an
-FP8 Qwen3.5/3.6 checkpoint. Build the extension first
+FP8 Qwen3.5/3.6 or Qwen3 MoE checkpoint. Build the extension first
 (`AFD_BUILD_FASTAFD_OPS=1`, see the
 [FastAFD guide](../../docs/gpu/FASTAFD_CONNECTOR_USER_GUIDE.md)). The MRV2
 evidence check covers Attention graph replays only; FastAFD FFN launches one
