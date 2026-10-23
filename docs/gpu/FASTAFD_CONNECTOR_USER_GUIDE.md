@@ -54,7 +54,10 @@ by default.
   kernel quantizes the hidden states to per-32 UE8M0 FP8 and sends each token
   to its experts' FFN ranks, and `combine` waits for the routed results and
   reduces the top-k. On Qwen3.5/3.6 the gated shared expert runs locally
-  between the two.
+  between the two. On Qwen3 MoE with `--enable-dbo` the step splits into two
+  microbatches on separate lanes, and each layer yields between `dispatch` and
+  `combine`, so one microbatch's Attention runs while the FFN ranks compute the
+  other's experts.
 - **FFN.** `FastAFDExpertExecutor` loads only its share of routed experts
   (`num_experts / F` per rank) from the checkpoint, requantizes the block
   scales to per-32 UE8M0 (one lossy e4m3 round trip), and launches one

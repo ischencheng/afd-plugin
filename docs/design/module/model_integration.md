@@ -182,8 +182,11 @@ With `FastAFDAFDConnector` Attention also owns the gate
 (`AFDQwen3MoeAttentionRoutedMoE`): it computes native softmax top-k with
 `norm_topk_prob` renormalization and hands the routed experts to the
 connector through the shared `afd_fastafd_dispatch` and `afd_fastafd_combine`
-custom ops in `fastafd_moe.py`. The copy that dispatch returns feeds combine,
-so `torch.compile` keeps the two kernels in order. FFN loads its routed experts
+custom ops in `fastafd_moe.py`. Under DBO each layer yields to the other
+microbatch between dispatch and combine, so its Attention overlaps the FFN
+ranks' expert compute; the lane is the microbatch index. The copy that
+dispatch returns passes through the yield op into combine, so `torch.compile`
+keeps the three in order. FFN loads its routed experts
 through `FastAFDFFNModelRunner` and does not build the model. Every layer must
 be a MoE layer, and the checkpoint must not have shared experts.
 
