@@ -231,9 +231,11 @@ layer), and LoRA before language-model construction. KDA is a hybrid state
 model, so native hybrid DBO validation applies.
 
 Hardware evidence covers an 8-layer cut of the official FP8 checkpoint, run as
-1A1F eager and graph against the native single-GPU model. The opt-in suite in
-`tests/e2e/models/glm5_next/` runs the full checkpoint as 2A2F and needs four
-GPUs with at least 180 GB each.
+1A1F against the native single-GPU model. Short eager requests sent one at a
+time give the same tokens as native; a 10.7K-token prompt also varies between
+native runs. Graph decode differs from native at fixed tokens; the cause is not
+identified yet. The opt-in suite in `tests/e2e/models/glm5_next/`
+runs the full checkpoint as 2A2F and needs four GPUs with at least 180 GB each.
 
 ## Forward-context contract
 

@@ -152,6 +152,8 @@ def _vllm_config(*, language_model_only: bool = True) -> SimpleNamespace:
 
 @pytest.fixture
 def construction_env(monkeypatch: pytest.MonkeyPatch):
+    # The shared stage double records constructor prefixes; these tests check
+    # the constructed module kinds and parameters instead.
     calls: dict[str, list[str]] = {
         "kda": [],
         "mla": [],
@@ -190,7 +192,7 @@ def construction_env(monkeypatch: pytest.MonkeyPatch):
         "parse_afd_config",
         lambda *_args, **_kwargs: AFDConfig(role=role[0]),
     )
-    return SimpleNamespace(calls=calls, role=role)
+    return SimpleNamespace(role=role)
 
 
 def _make_layer(construction_env, *, role: str, layer_idx: int):
@@ -216,12 +218,9 @@ def test_attention_role_constructs_attention_norms_and_mhc_only(
 ) -> None:
     layer = _make_layer(construction_env, role="attention", layer_idx=layer_idx)
 
-    assert construction_env.calls[attention_kind] == [
-        f"model.layers.{layer_idx}.self_attn"
-    ]
-    assert construction_env.calls["norm"] == ["", ""]
-    assert construction_env.calls["dense"] == []
-    assert construction_env.calls["moe"] == []
+    assert layer.self_attn.kind == attention_kind
+    assert layer.input_layernorm.kind == "norm"
+    assert layer.post_attention_layernorm.kind == "norm"
     assert isinstance(layer.mlp, adapter.RemoteFFNProxy)
     assert layer.mlp.layer_idx == layer_idx
     assert set(dict(layer.named_parameters())) == {
@@ -244,12 +243,10 @@ def test_ffn_role_constructs_only_native_ffn_block(
 ) -> None:
     layer = _make_layer(construction_env, role="ffn", layer_idx=layer_idx)
 
-    assert construction_env.calls[ffn_kind] == [f"model.layers.{layer_idx}.mlp"]
-    assert construction_env.calls["kda"] == []
-    assert construction_env.calls["mla"] == []
-    assert construction_env.calls["norm"] == []
+    assert layer.mlp.kind == ffn_kind
     assert isinstance(layer.self_attn, _FakeMissingLayer)
     assert isinstance(layer.input_layernorm, _FakeMissingLayer)
+    assert isinstance(layer.post_attention_layernorm, _FakeMissingLayer)
     assert set(dict(layer.named_parameters())) == {"mlp.weight"}
 
 
