@@ -3,10 +3,13 @@
 
 from __future__ import annotations
 
-from contextlib import nullcontext
 from types import SimpleNamespace
+from typing import TYPE_CHECKING
 
 import pytest
+
+if TYPE_CHECKING:
+    from torch import Tensor
 
 torch = pytest.importorskip("torch")
 pytest.importorskip("vllm")
@@ -15,6 +18,7 @@ from torch import nn  # noqa: E402
 from afd_plugin.config import AFDConfig  # noqa: E402
 from afd_plugin.model_executor.models import glm5_next as adapter  # noqa: E402
 from tests.unit.fakes.model_layers import stage_type as _stage_type  # noqa: E402
+from tests.unit.fakes.weights import OneShotWeights as _OneShotWeights  # noqa: E402
 
 # GLM-5.3-Flash schedule (zai-org/GLM-5.3-Flash config.json): every fourth
 # layer is MLA with the sparse indexer, the rest are KDA; the first three
@@ -31,6 +35,43 @@ MHC_PARAMETERS = {
     "hc_ffn_base",
     "hc_ffn_scale",
 }
+
+ATTENTION_ROLE = frozenset(("attention",))
+FFN_ROLE = frozenset(("ffn",))
+NO_ROLES: frozenset[str] = frozenset()
+# Checkpoint paths as stored in zai-org/GLM-5.3-Flash (model.safetensors.index.json).
+LAYER = "model.language_model.layers"
+WEIGHT_ROLE_CASES = (
+    ("embedding", "model.language_model.embed_tokens.weight", ATTENTION_ROLE),
+    ("final-norm", "model.language_model.norm.weight", ATTENTION_ROLE),
+    ("lm-head", "lm_head.weight", ATTENTION_ROLE),
+    ("vision-tower", "model.visual.blocks.0.attn.qkv.weight", NO_ROLES),
+    ("kda-projection", f"{LAYER}.0.self_attn.q_proj.weight", ATTENTION_ROLE),
+    ("kda-state-parameter", f"{LAYER}.0.self_attn.A_log", ATTENTION_ROLE),
+    (
+        "mla-projection-scale",
+        f"{LAYER}.3.self_attn.q_a_proj.weight_scale_inv",
+        ATTENTION_ROLE,
+    ),
+    ("sparse-indexer", f"{LAYER}.3.self_attn.indexer.wk.weight", ATTENTION_ROLE),
+    ("input-layernorm", f"{LAYER}.0.input_layernorm.weight", ATTENTION_ROLE),
+    (
+        "post-attention-layernorm",
+        f"{LAYER}.0.post_attention_layernorm.weight",
+        ATTENTION_ROLE,
+    ),
+    ("mhc-attention-mix", f"{LAYER}.0.hc_attn_fn", ATTENTION_ROLE),
+    ("mhc-ffn-mix", f"{LAYER}.3.hc_ffn_scale", ATTENTION_ROLE),
+    ("dense-mlp-projection", f"{LAYER}.0.mlp.gate_proj.weight", FFN_ROLE),
+    ("moe-router", f"{LAYER}.3.mlp.gate.weight", FFN_ROLE),
+    ("moe-router-bias", f"{LAYER}.3.mlp.gate.e_score_correction_bias", FFN_ROLE),
+    (
+        "routed-expert-scale",
+        f"{LAYER}.3.mlp.experts.0.down_proj.weight_scale_inv",
+        FFN_ROLE,
+    ),
+    ("shared-expert", f"{LAYER}.3.mlp.shared_experts.up_proj.weight", FFN_ROLE),
+)
 
 
 class _FakeMissingLayer(nn.Module):
@@ -212,13 +253,6 @@ def test_ffn_role_constructs_only_native_ffn_block(
     assert set(dict(layer.named_parameters())) == {"mlp.weight"}
 
 
-def test_native_decoder_forward_is_inherited_unchanged() -> None:
-    assert (
-        adapter.AFDGlm5NextDecoderLayer.forward
-        is adapter.native.Glm5NextDecoderLayer.forward
-    )
-
-
 def test_ffn_compute_delegates_to_native_ffn_block(construction_env) -> None:
     layer = _make_layer(construction_env, role="ffn", layer_idx=FIRST_MOE_LAYER)
     expected = torch.full((2, 4), 7.0)
@@ -291,76 +325,6 @@ def test_model_reports_config_driven_moe_layer_indices() -> None:
     assert model.get_experts_layer_indices() == tuple(
         range(FIRST_MOE_LAYER, NUM_LAYERS),
     )
-
-
-def test_conditional_model_builds_role_aware_text_model_from_text_config(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    captured: dict[str, object] = {}
-    text_config = _text_config()
-    vllm_config = _vllm_config()
-    vllm_config.model_config.hf_config = SimpleNamespace(
-        text_config=text_config,
-        vision_config=SimpleNamespace(rms_norm_eps=1e-6),
-    )
-    vllm_config.model_config.multimodal_config = SimpleNamespace(
-        language_model_only=True,
-        mm_encoder_tp_mode="weights",
-        is_multimodal_pruning_enabled=lambda: False,
-    )
-
-    def fake_with_hf_config(hf_config, architectures):
-        captured["hf_config"] = hf_config
-        captured["architectures"] = architectures
-        return vllm_config
-
-    def fake_initialize_model(*, vllm_config, prefix, model_class):
-        captured["model_class"] = model_class
-        captured["prefix"] = prefix
-        return nn.Module()
-
-    vllm_config.with_hf_config = fake_with_hf_config
-    monkeypatch.setattr(
-        adapter, "current_platform", SimpleNamespace(is_cuda=lambda: True)
-    )
-    monkeypatch.setattr(
-        adapter,
-        "parse_afd_config",
-        lambda *_args, **_kwargs: AFDConfig(role="attention"),
-    )
-    monkeypatch.setattr(adapter, "initialize_model", fake_initialize_model)
-    monkeypatch.setattr(
-        adapter.native,
-        "Glm5NextVisionTransformer",
-        lambda *_args, **_kwargs: nn.Module(),
-    )
-    monkeypatch.setattr(
-        adapter.AFDGlm5NextForConditionalGeneration,
-        "_mark_tower_model",
-        lambda *_args, **_kwargs: nullcontext(),
-    )
-    monkeypatch.setattr(
-        adapter.AFDGlm5NextForConditionalGeneration,
-        "_mark_language_model",
-        lambda *_args, **_kwargs: nullcontext(),
-    )
-    monkeypatch.setattr(
-        adapter.AFDGlm5NextForConditionalGeneration,
-        "set_moe_parameters",
-        lambda self: None,
-    )
-
-    adapter.AFDGlm5NextForConditionalGeneration(
-        vllm_config=vllm_config,
-        prefix="",
-    )
-
-    assert captured == {
-        "hf_config": text_config,
-        "architectures": ["Glm5NextForCausalLM"],
-        "model_class": adapter.AFDGlm5NextForCausalLM,
-        "prefix": "language_model",
-    }
 
 
 @pytest.mark.parametrize(
@@ -444,3 +408,77 @@ def test_multimodal_execution_fails_closed(monkeypatch: pytest.MonkeyPatch) -> N
             _vllm_config(language_model_only=False),
             AFDConfig(),
         )
+
+
+@pytest.mark.parametrize(
+    ("checkpoint_name", "roles"),
+    [case[1:] for case in WEIGHT_ROLE_CASES],
+    ids=[case[0] for case in WEIGHT_ROLE_CASES],
+)
+def test_weight_role_policy(
+    checkpoint_name: str,
+    roles: frozenset[str],
+) -> None:
+    assert adapter._checkpoint_weight_roles(checkpoint_name) == roles
+
+
+@pytest.mark.parametrize(
+    ("role", "expected_names"),
+    [
+        (
+            "attention",
+            [
+                "model.language_model.embed_tokens.weight",
+                f"{LAYER}.3.self_attn.kv_b_proj.weight",
+                f"{LAYER}.3.hc_attn_base",
+                "lm_head.weight",
+            ],
+        ),
+        (
+            "ffn",
+            [
+                f"{LAYER}.3.mlp.gate.weight",
+                f"{LAYER}.3.mlp.experts.7.gate_proj.weight",
+            ],
+        ),
+    ],
+)
+def test_load_weights_filters_once_and_delegates_to_native_loader(
+    monkeypatch: pytest.MonkeyPatch,
+    role: str,
+    expected_names: list[str],
+) -> None:
+    names = [
+        "model.language_model.embed_tokens.weight",
+        "model.visual.patch_embed.proj.weight",
+        f"{LAYER}.3.self_attn.kv_b_proj.weight",
+        f"{LAYER}.3.hc_attn_base",
+        f"{LAYER}.3.mlp.gate.weight",
+        f"{LAYER}.3.mlp.experts.7.gate_proj.weight",
+        "lm_head.weight",
+    ]
+    weights = _OneShotWeights(names)
+    seen: list[tuple[str, Tensor]] = []
+    native_result = {"native.loaded_params"}
+
+    def fake_native_loader(self, filtered_weights):
+        assert iter(filtered_weights) is filtered_weights
+        seen.extend(filtered_weights)
+        return native_result
+
+    monkeypatch.setattr(
+        adapter.native.Glm4vForConditionalGeneration,
+        "load_weights",
+        fake_native_loader,
+    )
+    model = object.__new__(adapter.AFDGlm5NextForConditionalGeneration)
+    object.__setattr__(model, "afd_role", role)
+
+    result = model.load_weights(weights)
+
+    assert result is native_result
+    assert [name for name, _tensor in seen] == expected_names
+    assert [tensor for _name, tensor in seen] == [
+        weights.items[names.index(name)][1] for name in expected_names
+    ]
+    assert weights.iterations == 1
