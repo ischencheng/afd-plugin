@@ -22,6 +22,7 @@ validation_paths:
 upstream_refs:
   - "vLLM vllm.model_executor.models.deepseek_v2"
   - "vLLM vllm.model_executor.models.qwen3_moe"
+  - "vLLM vllm.models.glm5next"
   - "vLLM vllm.forward_context.ForwardContext"
   - "vLLM vllm.model_executor.model_loader"
 verified_platform_refs:
@@ -59,6 +60,7 @@ make a backend-specific worker class the shared model API.
 | Role-aware model and weight loading | [`deepseek_v2.py`](../../../afd_plugin/model_executor/models/deepseek_v2.py) | [`test_forward_context.py`](../../../tests/unit/model_executor/models/test_forward_context.py), model and accuracy E2E suites |
 | DeepSeek V4 CUDA role boundary | [`deepseek_v4.py`](../../../afd_plugin/model_executor/models/deepseek_v4.py) | [`test_deepseek_v4_construction.py`](../../../tests/unit/model_executor/models/test_deepseek_v4_construction.py), [`test_deepseek_v4_proxy.py`](../../../tests/unit/model_executor/models/test_deepseek_v4_proxy.py), [`test_deepseek_v4_weight_policy.py`](../../../tests/unit/model_executor/models/test_deepseek_v4_weight_policy.py) |
 | DeepSeek V4 Ascend Hash-id boundary | [`npu/deepseek_v4.py`](../../../afd_plugin/model_executor/models/npu/deepseek_v4.py), [`npu/deepseek_v4_attention_gate.py`](../../../afd_plugin/model_executor/models/npu/deepseek_v4_attention_gate.py) | [`test_deepseek_v4_hash_ids.py`](../../../tests/unit/model_executor/test_deepseek_v4_hash_ids.py), [`test_deepseek_v4_npu_weight_roles.py`](../../../tests/unit/model_executor/test_deepseek_v4_npu_weight_roles.py), ids-mode cases in [`test_camp2p_token_ids.py`](../../../tests/unit/connectors/test_camp2p_token_ids.py) |
+| GLM-5.3-Flash CUDA role boundary | [`glm5_next.py`](../../../afd_plugin/model_executor/models/glm5_next.py) | [`test_glm5_next_construction.py`](../../../tests/unit/model_executor/models/test_glm5_next_construction.py), [`test_glm5_next_weight_policy.py`](../../../tests/unit/model_executor/models/test_glm5_next_weight_policy.py) |
 | Qwen3 MoE role-aware model and weight loading | [`qwen3_moe.py`](../../../afd_plugin/model_executor/models/qwen3_moe.py) | [`test_qwen3_moe_construction.py`](../../../tests/unit/model_executor/models/test_qwen3_moe_construction.py), [`test_qwen3_moe_weight_policy.py`](../../../tests/unit/model_executor/models/test_qwen3_moe_weight_policy.py) |
 | CUDA remote-experts boundary | [`deepseek_v2.py`](../../../afd_plugin/model_executor/models/deepseek_v2.py), [`gpu/p2p.py`](../../../afd_plugin/connectors/gpu/p2p.py) | [`test_p2p_experts_contract.py`](../../../tests/unit/connectors/test_p2p_experts_contract.py), [`test_deepseek_v2_proxy.py`](../../../tests/unit/model_executor/models/test_deepseek_v2_proxy.py) |
 | Forward-context adapter | [`forward_context.py`](../../../afd_plugin/model_executor/models/forward_context.py) | [`test_forward_context.py`](../../../tests/unit/model_executor/models/test_forward_context.py) |
@@ -83,14 +85,16 @@ registers lazy AFD wrapper paths under `AFD`-prefixed aliases.
 | `GlmMoeDsaForCausalLM` | `AFDGlmMoeDsaForCausalLM` | `AFDGlmMoeDsaForCausalLM` |
 | `Qwen3MoeForCausalLM` | `AFDQwen3MoeForCausalLM` | `AFDQwen3MoeForCausalLM` |
 | `Qwen3_5MoeForConditionalGeneration` | `AFDQwen3_5MoeForConditionalGeneration` | `AFDQwen3_5MoeForConditionalGeneration` |
+| `Glm5NextForConditionalGeneration` | `AFDGlm5NextForConditionalGeneration` | `AFDGlm5NextForConditionalGeneration` |
 
 Only AFD workers switch their worker-local model configuration to the matching
 alias before constructing the AFD model runner. Non-AFD workers keep the
 checkpoint architecture and resolve to vLLM's native model class.
 
 The DeepSeek, DeepSeek V2/V3/V3.2, and GLM aliases share the DeepSeek
-V2-derived implementation. DeepSeek V4, Qwen3 MoE, and Qwen3.5/3.6 each have a
-separate wrapper around their matching native architecture. These aliases
+V2-derived implementation. DeepSeek V4, Qwen3 MoE, Qwen3.5/3.6, and
+GLM-5.3-Flash each have a separate wrapper around their matching native
+architecture. These aliases
 express known compatible architecture families; they do not make any wrapper
 a generic MoE model API.
 
@@ -199,6 +203,32 @@ removed adapter and do not qualify the current implementation. The current
 2A1F suite keeps static EP and PP1. Attention-side router transport, async
 communication, multi-node, quantization, and performance remain outside the
 validated scope.
+
+### GLM-5.3-Flash CUDA boundary
+
+`AFDGlm5NextForConditionalGeneration` wraps vLLM's NVIDIA `glm5next`
+implementation (`GLM-5.3-Flash`: KDA linear attention and MLA with the sparse
+indexer, dense MLP in the first layers, MoE elsewhere, and mHC residual
+streams). The split is at each decoder layer's `mlp` call. Attention owns
+KDA/MLA attention, both norms, all mHC parameters and state, the sparse-index
+buffer, embeddings, final norm, and LM head, and runs the native decoder
+forward with a parameter-free `RemoteFFNProxy` as `mlp`. Only the normalized
+two-dimensional FFN input crosses the boundary. FFN owns the complete native
+dense MLP or `Glm5NextMoE` (router, routed experts, and shared expert) for
+every layer and returns its output.
+
+The multimodal shell keeps native tower staging and builds
+`AFDGlm5NextForCausalLM` through `initialize_model` with the text config, as
+the native registry path does. Checkpoint weights are filtered once at the
+shell: layer `mlp` paths go to FFN, other layer paths (attention, norms, mHC)
+and non-layer text paths go to Attention, and vision-tower paths are not
+loaded. The native text loader runs unchanged.
+
+This path is CUDA-only and text-only: it requires `--language-model-only` and
+`compute_gate_on_attention=false`, and rejects sequence-parallel MoE, EPLB,
+pipeline parallelism, speculative decoding (including the checkpoint's MTP
+layer), and LoRA before language-model construction. KDA is a hybrid state
+model, so native hybrid DBO validation applies.
 
 ## Forward-context contract
 

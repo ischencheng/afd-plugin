@@ -48,6 +48,7 @@ Model support:
 | --- | --- | --- | --- |
 | DeepSeekV2 / DeepSeekV3 / DeepSeekV3.2 | `DeepseekForCausalLM`, `DeepseekV2ForCausalLM`, `DeepseekV3ForCausalLM`, `DeepseekV32ForCausalLM` | `AFDDeepseekForCausalLM`, `AFDDeepseekV2ForCausalLM`, `AFDDeepseekV3ForCausalLM` | DeepSeekV3.2 uses `AFDDeepseekV3ForCausalLM`. Each AFD role constructs and loads only its role-required model components, while shared embedding, normalization, and output components remain available where required by the model lifecycle. |
 | Qwen3 MoE | `Qwen3MoeForCausalLM` | `AFDQwen3MoeForCausalLM` | CUDA with `compute_gate_on_attention=false`. |
+| GLM-5.3-Flash | `Glm5NextForConditionalGeneration` | `AFDGlm5NextForConditionalGeneration` | CUDA text-only with `--language-model-only` and `compute_gate_on_attention=false`; synchronous `P2pNcclAFDConnector`, eager and `FULL_DECODE_ONLY` graph. See the [model integration notes](docs/design/module/model_integration.md#glm-53-flash-cuda-boundary). |
 | Qwen3.5 / Qwen3.6 MoE | `Qwen3_5MoeForConditionalGeneration` | `AFDQwen3_5MoeForConditionalGeneration` | CUDA text-only Qwen3.6-35B-A3B with `--language-model-only`, native DP4/TP1/EP4, and synchronous AFD 2A1F. Eager and graph execution remain supported; GDN DBO is temporarily withdrawn; native hybrid/multimodal validation applies. Earlier DBO experiments are historical evidence only; see the [E2E limits](docs/design/module/e2e_testing.md). |
 
 Connector support:

@@ -67,6 +67,7 @@ def test_qwen3_moe_afd_model_registration_path_is_lazy_string():
         **afd_plugin._DEEPSEEK_MODEL_REGISTRATIONS,
         **registrations,
         **afd_plugin._QWEN3_5_MODEL_REGISTRATIONS,
+        **afd_plugin._GLM5_NEXT_MODEL_REGISTRATIONS,
     } == afd_plugin._MODEL_REGISTRATIONS
 
 
@@ -76,6 +77,16 @@ def test_qwen3_5_afd_model_registration_path_is_lazy_string():
     assert registrations["Qwen3_5MoeForConditionalGeneration"] == (
         "afd_plugin.model_executor.models.qwen3_5:AFDQwen3_5MoeForConditionalGeneration"
     )
+
+
+def test_glm5_next_afd_model_registration_path_is_lazy_string():
+    registrations = afd_plugin._GLM5_NEXT_MODEL_REGISTRATIONS
+
+    assert registrations == {
+        "Glm5NextForConditionalGeneration": (
+            "afd_plugin.model_executor.models.glm5_next:AFDGlm5NextForConditionalGeneration"
+        )
+    }
 
 
 def test_merged_model_registrations_include_both_qwen_families():
@@ -97,52 +108,50 @@ def test_merged_model_registrations_are_immutable():
         afd_plugin._MODEL_REGISTRATIONS["Qwen3_5MoeForConditionalGeneration"] = ""
 
 
-def test_register_afd_does_not_replace_native_deepseek_model():
+NATIVE_REGISTRATION_CASES = (
+    (
+        "DeepseekV2ForCausalLM",
+        "vllm.model_executor.models.deepseek_v2",
+        "DeepseekV2ForCausalLM",
+    ),
+    (
+        "Qwen3MoeForCausalLM",
+        "vllm.model_executor.models.qwen3_moe",
+        "Qwen3MoeForCausalLM",
+    ),
+    (
+        "Qwen3_5MoeForConditionalGeneration",
+        "vllm.model_executor.models.qwen3_5",
+        "Qwen3_5MoeForConditionalGeneration",
+    ),
+    ("DeepseekV4ForCausalLM", "vllm.models.deepseek_v4", "DeepseekV4ForCausalLM"),
+    (
+        "Glm5NextForConditionalGeneration",
+        "vllm.models.glm5next",
+        "Glm5NextForConditionalGeneration",
+    ),
+)
+
+
+@pytest.mark.parametrize(
+    ("model_arch", "native_module", "native_class"),
+    NATIVE_REGISTRATION_CASES,
+    ids=[case[0] for case in NATIVE_REGISTRATION_CASES],
+)
+def test_register_afd_does_not_replace_native_model(
+    model_arch: str,
+    native_module: str,
+    native_class: str,
+) -> None:
     pytest.importorskip("vllm")
     from vllm.model_executor.models import ModelRegistry
 
     afd_plugin.register_afd()
 
-    native_registration = ModelRegistry.models["DeepseekV2ForCausalLM"]
-    assert native_registration.module_name == "vllm.model_executor.models.deepseek_v2"
-    assert native_registration.class_name == "DeepseekV2ForCausalLM"
-    assert "AFDDeepseekV2ForCausalLM" in ModelRegistry.models
-
-
-def test_register_afd_does_not_replace_native_qwen3_moe_model():
-    pytest.importorskip("vllm")
-    from vllm.model_executor.models import ModelRegistry
-
-    afd_plugin.register_afd()
-
-    native_registration = ModelRegistry.models["Qwen3MoeForCausalLM"]
-    assert native_registration.module_name == "vllm.model_executor.models.qwen3_moe"
-    assert native_registration.class_name == "Qwen3MoeForCausalLM"
-    assert "AFDQwen3MoeForCausalLM" in ModelRegistry.models
-
-
-def test_register_afd_does_not_replace_native_qwen3_5_model():
-    pytest.importorskip("vllm")
-    from vllm.model_executor.models import ModelRegistry
-
-    afd_plugin.register_afd()
-
-    native_registration = ModelRegistry.models["Qwen3_5MoeForConditionalGeneration"]
-    assert native_registration.module_name == "vllm.model_executor.models.qwen3_5"
-    assert native_registration.class_name == "Qwen3_5MoeForConditionalGeneration"
-    assert "AFDQwen3_5MoeForConditionalGeneration" in ModelRegistry.models
-
-
-def test_register_afd_does_not_replace_native_deepseek_v4_model():
-    pytest.importorskip("vllm")
-    from vllm.model_executor.models import ModelRegistry
-
-    afd_plugin.register_afd()
-
-    native_registration = ModelRegistry.models["DeepseekV4ForCausalLM"]
-    assert native_registration.module_name == "vllm.models.deepseek_v4"
-    assert native_registration.class_name == "DeepseekV4ForCausalLM"
-    assert "AFDDeepseekV4ForCausalLM" in ModelRegistry.models
+    native_registration = ModelRegistry.models[model_arch]
+    assert native_registration.module_name == native_module
+    assert native_registration.class_name == native_class
+    assert f"AFD{model_arch}" in ModelRegistry.models
 
 
 def test_afd_model_config_uses_private_architecture_copy():

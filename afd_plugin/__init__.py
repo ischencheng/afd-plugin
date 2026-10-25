@@ -130,11 +130,20 @@ _QWEN3_5_MODEL_REGISTRATIONS = MappingProxyType(
     }
 )
 
+_GLM5_NEXT_MODEL_REGISTRATIONS = MappingProxyType(
+    {
+        "Glm5NextForConditionalGeneration": (
+            "afd_plugin.model_executor.models.glm5_next:AFDGlm5NextForConditionalGeneration"
+        ),
+    }
+)
+
 _MODEL_REGISTRATIONS = MappingProxyType(
     {
         **_DEEPSEEK_MODEL_REGISTRATIONS,
         **_QWEN_MODEL_REGISTRATIONS,
         **_QWEN3_5_MODEL_REGISTRATIONS,
+        **_GLM5_NEXT_MODEL_REGISTRATIONS,
     }
 )
 
@@ -227,6 +236,7 @@ __all__ = [
     "parse_optional_afd_config",
     "__version__",
     "_DEEPSEEK_MODEL_REGISTRATIONS",
+    "_GLM5_NEXT_MODEL_REGISTRATIONS",
     "_MODEL_REGISTRATIONS",
     "_QWEN_MODEL_REGISTRATIONS",
     "_QWEN3_5_MODEL_REGISTRATIONS",
