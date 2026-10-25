@@ -230,6 +230,11 @@ pipeline parallelism, speculative decoding (including the checkpoint's MTP
 layer), and LoRA before language-model construction. KDA is a hybrid state
 model, so native hybrid DBO validation applies.
 
+Hardware evidence covers an 8-layer cut of the official FP8 checkpoint, run as
+1A1F eager and graph against the native single-GPU model. The opt-in suite in
+`tests/e2e/models/glm5_next/` runs the full checkpoint as 2A2F and needs four
+GPUs with at least 180 GB each.
+
 ## Forward-context contract
 
 The runner installs `AFDForwardContextMetadata` in
